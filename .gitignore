@@ -5,3 +5,5 @@ results/
 .venv/
 __pycache__/
 .claude/settings.local.json
+site/
+site.json

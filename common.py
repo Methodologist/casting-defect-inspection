@@ -62,6 +62,9 @@ def settings():
     if not path.exists():
         sys.exit("settings.json is missing. Copy settings.example.json to settings.json and put your bucket name in it.")
     s = json.loads(path.read_text())
+    if os.environ.get("VISION_DATASET"):  # pick a dataset for one command without editing settings.json
+        s["dataset"] = os.environ["VISION_DATASET"]
+        s.pop("project", None)
     s.setdefault("dataset", "casting")
     if s["dataset"] not in DATASETS:
         sys.exit(f"settings.json has dataset '{s['dataset']}'. Use one of: {', '.join(DATASETS)}.")
@@ -246,7 +249,9 @@ def explain(e):
     err = e.response.get("Error", {})
     code, msg = err.get("Code", ""), err.get("Message", "")
     hint = ""
-    if "AccessDenied" in code or code == "UnauthorizedOperation":
+    if "verified" in msg.lower():
+        hint = "\nThis is an account-level restriction on new AWS accounts, not a missing permission."
+    elif "AccessDenied" in code or code == "UnauthorizedOperation":
         hint = ("\nYour AWS identity is missing a permission. If this worked before, check whether the account hit a "
                 "spend limit or ran out of Free plan credits. If you use an IAM user, it needs "
                 "AmazonRekognitionCustomLabelsFullAccess and AmazonRekognitionReadOnlyAccess, and the bucket name "

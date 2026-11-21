@@ -1,23 +1,25 @@
-# Casting defect inspection with Amazon Rekognition
+# Casting defect inspection: Amazon Rekognition vs. our own CNN
 
 [![tests](https://github.com/Methodologist/casting-defect-inspection/actions/workflows/tests.yml/badge.svg)](https://github.com/Methodologist/casting-defect-inspection/actions/workflows/tests.yml)
 
 > **Showcase project.** A portfolio demonstration of camera-based pass/fail inspection on AWS, built on public
 > datasets. It is not a production system and is not maintained as a library.
 >
-> - **[Interactive results](https://main.d1vk1voghz7z5z.amplifyapp.com/)**: every held-out image with the
->   model's verdict; click any image to inspect it.
+> - **[Interactive results](https://main.d1vk1voghz7z5z.amplifyapp.com/)**: switch between the two models, see
+>   every held-out image with its verdict and our CNN's heatmap, and click any image to inspect it.
 > - **[Project overview (PDF)](docs/project-overview.pdf)**: a two-page summary of what was built, the
 >   results and the lessons.
 
 ## Results at a glance
 
-Measured on held-out images the model never saw during training or AWS's own evaluation.
+Two models, trained on the same images and measured on the same held-out images, which neither saw during
+training: **Amazon Rekognition Custom Labels** (managed by AWS) and **our own CNN** (a ResNet-18 fine-tuned in
+PyTorch on a local GPU, with heatmaps showing where it looks).
 
-| Dataset | Held-out accuracy | Defects missed | Good items rejected | AWS test-set F1* |
-|---|---|---|---|---|
-| Cast pump impellers | **100%** (100 images) | 0 of 50 | 0 of 50 | 100% (200 images) |
-| Shipping cases, damaged vs intact | **88.6%** (88 images) | 6 of 39 | 4 of 49 | 95.7% (116 images) |
+| Dataset | Rekognition held-out accuracy | Our CNN held-out accuracy | Defects missed (Rek. / CNN) | Good items rejected (Rek. / CNN) | AWS test-set F1* |
+|---|---|---|---|---|---|
+| Cast pump impellers | **100%** (100 images) | **100%** | 0 / 0 of 50 | 0 / 0 of 50 | 100% (200 images) |
+| Shipping cases, damaged vs intact | **88.6%** (88 images) | **76.1%** | 6 / 20 of 39 | 4 / 1 of 49 | 95.7% (116 images) |
 
 \* AWS reports F1 at a confidence cut-off it picks for each label after training. Its confusion matrix for the
 same casting test set is not quite perfect: it shows 2 of the 100 defective castings labeled "ok". The held-out
@@ -30,6 +32,12 @@ columns simply take the model's top guess for each image.
 - **Messy data needs skepticism:** the web-collected shipping-case photos also differ in box type, and the model's
   held-out mistakes cluster where box type and damage disagree. It partly learned the shortcut, which is why a
   production model is trained on consistent photos from the real station.
+- **On clean data, our own CNN matched the managed service; on messy data, the managed service did better.** Our
+  CNN tied Rekognition on castings, and its heatmaps land on the damaged rim of defective parts. On shipping cases
+  it leaned toward "intact" and missed 20 of 39 damaged cases. Some of those "damaged" photos look undamaged (an
+  open carton, a takeout box), so the labels themselves are part of the problem.
+- **Fast enough for a line:** our CNN classifies one image in about 3 ms on a GTX 1070 and 15 to 18 ms on the CPU,
+  with no network round trip.
 
 The whole project used about $3 to $4 of AWS credits; models are stopped as soon as each test ends.
 
@@ -40,9 +48,13 @@ The whole project used about $3 to $4 of AWS credits; models are stopped as soon
   here, but a rotated copy of a training part can still appear in the test or held-out set, so some of the 100% may
   come from recognizing a part seen at another angle. A fair production test uses parts the model has never seen
   in any orientation.
-- **The model gives a verdict, not a location.** It learns which visual patterns go with each label, not what a
-  defect is, and can't say which part of the photo it based its call on. The shipping-case results show why that
-  matters: it partly learned box type instead of damage. The next step below adds heatmaps to check this.
+- **A classifier gives a verdict, not a location.** It learns which visual patterns go with each label, not what a
+  defect is. Rekognition can't show what it based a call on; our own CNN's Grad-CAM heatmaps show roughly where it
+  looked (a coarse 7×7 grid stretched over the photo), not a traced outline of the defect.
+- **Noisy labels in the shipping-case data.** Some photos filed as "damaged" show an open but intact carton, a
+  takeout food box or a stock photo of mixed packaging. Accuracy on that dataset partly measures the labels.
+- **One training run each.** No hyperparameter search was done for our CNN, and the held-out images were used only
+  once, after training, so they stay a fair test. A tuned model would likely do better on the shipping cases.
 - **Public datasets only.** Neither dataset comes from a real inspection station's camera, lighting or reject
   criteria, and the casting license is non-commercial.
 
@@ -130,6 +142,7 @@ folder, so the two runs never overwrite each other. Do the full run on `casting`
 | `step2_train.py` | Uploads the train and test images, builds the datasets, trains, prints precision/recall/F1 | about 1 to 2 hours, mostly waiting | about $1 to $3 |
 | `step3_test.py` | Starts the model, tests the held-out images, **stops it**, prints the confusion matrix | 10 to 40 min | about $0.50 to $4, depending on how long the model takes to start (about $0.50 here) |
 | `stop_model.py` | Shows every project's models and stops anything running, whichever dataset is selected | 1 to 5 min | $0 |
+| `train_local_cnn.py` | Trains our own CNN on the same images, on this PC (see [Our own CNN](#our-own-cnn-trained-locally)) | about 2 min with a GPU | $0 |
 
 You can close the window during `step2_train.py`. Running it again picks up where it left off.
 
@@ -157,9 +170,41 @@ link. Re-running it publishes the current build to the same link.
 .venv\Scripts\python deploy_site.py
 ```
 
-## Next step: where the model looks (SageMaker)
+## Our own CNN, trained locally
 
-Not run yet. `sagemaker/` holds the planned second experiment: fine-tune a ResNet-18 on the same training images in an Amazon
+`train_local_cnn.py` trains a second model of our own on the exact same images: a ResNet-18 convolutional neural
+network (PyTorch, starting from ImageNet weights), fine-tuned on the training set, the best pass picked on the test
+set, then scored once on the held-out set. It also draws a Grad-CAM heatmap for every held-out image, showing which
+parts of the photo pushed it toward "defective" or "damaged", and measures how long one image takes to classify.
+The results site gets a **Model** switch (Amazon Rekognition / Our own CNN), a side-by-side table, a diagram of the
+network following one real held-out part from photo to verdict and heatmap, and a heatmap gallery.
+
+Results of the run on a GTX 1070 (8 passes over the images, best pass picked on the test set):
+
+| Dataset | Training time | Best pass (test accuracy) | Held-out accuracy | Time per image: GPU / CPU |
+|---|---|---|---|---|
+| Cast pump impellers | 86 s (includes the first-run weights download) | 2 of 8 (99.5%) | 100% | 3.0 ms / 18.2 ms |
+| Shipping cases | 38 s | 3 of 8 (87.1%) | 76.1% | 3.4 ms / 15.5 ms |
+
+It needs no AWS access and costs nothing. An NVIDIA GPU is used if present (this run used a GTX 1070); without one
+it runs on the CPU, more slowly. One-time setup, using [uv](https://docs.astral.sh/uv/). PyTorch 2.5.1 built for
+CUDA 12.4 is used because the newest builds no longer support older (Pascal) cards like the GTX 10 series:
+
+```powershell
+uv venv .venv-gpu --python 3.11
+uv pip install --python .venv-gpu\Scripts\python.exe torch==2.5.1 torchvision==0.20.1 `
+    --index-url https://download.pytorch.org/whl/cu124 --extra-index-url https://pypi.org/simple `
+    --index-strategy unsafe-best-match
+.venv\Scripts\python train_local_cnn.py     # about 2 minutes on a GTX 1070
+.venv\Scripts\python build_site.py
+```
+
+The ImageNet starting weights download into `.cache/` in this folder; `.venv-gpu/` and `.cache/` are git-ignored.
+Set `UV_CACHE_DIR` if you want uv's download cache on a particular drive.
+
+## Next step: the same CNN on Amazon SageMaker AI
+
+Not run yet. `sagemaker/` runs the same training script as a SageMaker training job: fine-tune a ResNet-18 on the same training images in an Amazon
 SageMaker AI training job, test it on the same held-out images, and draw a Grad-CAM heatmap for each one,
 showing which parts of the photo pushed the model toward "defective" or "damaged". The results site adds a
 heatmap library (heat drawn as a separate, switchable layer over the unmodified photo) once real results exist.

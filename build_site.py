@@ -99,32 +99,46 @@ def load(name):
                            "conf": r["confidence"], "ok": r["correct"] == "yes"})
         d["holdout"] = {"summary": summary, "images": images}
 
-    # SageMaker Grad-CAM run (optional): only shown once real results exist.
-    sm_dir = out_dir / "sagemaker"
-    preds, metrics = read_json(sm_dir / "predictions.json"), read_json(sm_dir / "metrics.json")
-    d["sm"] = None
-    if preds and metrics and d["holdout"]:
-        srcs = {im["file"].name: im["src"] for im in d["holdout"]["images"]}
-        rows = []
-        for r in preds:
-            heat_file = sm_dir / r["heatmap"]
-            if r["file"] in srcs and heat_file.exists():
-                rows.append({"src": srcs[r["file"]], "heat_file": heat_file,
-                             "heat": f"heat/{name}/{heat_file.name}", "truth": r["true_label"],
-                             "pred": r["predicted"], "conf": r["confidence"], "ok": r["correct"]})
-        d["sm"] = {"metrics": metrics, "rows": rows}
+    # Our own CNN (ResNet-18 + Grad-CAM), optional: a SageMaker run if one was fetched, else the local run.
+    d["cnn"] = None
+    for cnn_dir in (out_dir / "sagemaker", out_dir / "cnn"):
+        preds, metrics = read_json(cnn_dir / "predictions.json"), read_json(cnn_dir / "metrics.json")
+        if preds and metrics and d["holdout"]:
+            break
+    else:
+        return d
+    srcs = {im["file"].name: im["src"] for im in d["holdout"]["images"]}
+    if {r["file"] for r in preds} != set(srcs):
+        sys.exit(f"{cnn_dir} was not tested on the same held-out images as Rekognition. Re-run train_local_cnn.py.")
+    rows = []
+    for r in preds:
+        heat_file = cnn_dir / r["heatmap"]
+        rows.append({"src": srcs[r["file"]], "heat_file": heat_file, "heat": f"heat/{name}/{heat_file.name}",
+                     "truth": r["true_label"], "pred": r["predicted"], "conf": r["confidence"], "ok": r["correct"],
+                     "evidence": r.get("evidence", 0)})
+    summary = {"images": metrics["heldout_images"], "true_positive": metrics["tp"],
+               "false_negative": metrics["fn"], "false_positive": metrics["fp"], "true_negative": metrics["tn"],
+               "accuracy": metrics["heldout_accuracy"], "recall": metrics["recall"],
+               "precision": metrics["precision"]}
+    d["cnn"] = {"metrics": metrics, "rows": rows, "summary": summary}
     return d
+
+
+def cnn_where(m):
+    """Where our CNN was trained, in plain words."""
+    if m.get("trained_on") == "Amazon SageMaker AI":
+        return "in an Amazon SageMaker AI training job"
+    return f'locally on an {m["hardware"]}' if m.get("hardware", "").startswith("NVIDIA") else "locally on a PC"
 
 
 def pct(x, digits=0):
     return "–" if x is None else f"{100 * x:.{digits}f}%"
 
 
-def kpis(d):
-    ds, h = d["ds"], d["holdout"]
-    if not h:
+def kpis(d, s):
+    ds = d["ds"]
+    if not s:
         return f'<p class="pending">Held-out test for {esc(ds["title"])} not run yet.</p>'
-    s = h["summary"]
     pos_total = s["true_positive"] + s["false_negative"]
     neg_total = s["false_positive"] + s["true_negative"]
     tiles = [
@@ -161,11 +175,10 @@ def baseline_table(d):
             f'<p>{esc(BASELINE_NOTES.get(d["name"], ""))}</p>')
 
 
-def confusion(d):
-    ds, h = d["ds"], d["holdout"]
-    if not h:
+def confusion(d, s):
+    if not s:
         return ""
-    s, pos, neg = h["summary"], ds["positive"], ds["negative"]
+    pos, neg = d["ds"]["positive"], d["ds"]["negative"]
     return (f'<div class="tablewrap"><table class="confusion"><thead><tr><th></th><th>Predicted {esc(pos)}</th>'
             f'<th>Predicted {esc(neg)}</th></tr></thead><tbody>'
             f'<tr><th>Actually {esc(pos)}</th><td class="good">{s["true_positive"]}<small>caught</small></td>'
@@ -192,9 +205,9 @@ def heat_data(data):
     """Heatmap library items, classes interleaved like the verdict gallery."""
     items = []
     for d in data:
-        if not d["sm"]:
+        if not d["cnn"]:
             continue
-        by_class = [[r for r in d["sm"]["rows"] if r["truth"] == label] for label in d["ds"]["labels"]]
+        by_class = [[r for r in d["cnn"]["rows"] if r["truth"] == label] for label in d["ds"]["labels"]]
         for n in range(max((len(c) for c in by_class), default=0)):
             for c in by_class:
                 if n < len(c):
@@ -204,34 +217,163 @@ def heat_data(data):
     return items
 
 
-def heat_section(data):
-    runs = [d for d in data if d["sm"]]
+def compare_table(data):
+    """Both models side by side on the same held-out images. Shown whichever model is selected."""
+    runs = [d for d in data if d["cnn"] and d["holdout"]]
     if not runs:
         return ""
     rows = ""
     for d in runs:
-        m, s = d["sm"]["metrics"], (d["holdout"] or {}).get("summary", {})
-        rows += (f'<tr><td>{esc(d["ds"]["title"].capitalize())}</td>'
-                 f'<td>{pct(s.get("accuracy"), 1)}</td><td>{pct(m["heldout_accuracy"], 1)}</td>'
-                 f'<td>{s.get("false_negative", "–")} / {m["fn"]}</td><td>{s.get("false_positive", "–")} / {m["fp"]}</td></tr>')
-    return f'''<section><div class="wrap">
-<h2>Where the model looks</h2>
-<p class="sub">A second model, a ResNet-18 fine-tuned in an Amazon SageMaker AI training job on the same training
-images, with Grad-CAM heatmaps showing which parts of each held-out image pushed it toward
-"{esc(runs[0]["ds"]["positive"])}". Heat is drawn as a separate layer over the unmodified photo; switch it off to
-compare.</p>
-<div class="tablewrap"><table class="eval"><thead><tr><th>Dataset</th><th>Rekognition held-out accuracy</th>
-<th>SageMaker ResNet-18 held-out accuracy</th><th>Missed (Rekognition / SageMaker)</th>
-<th>False rejects (Rekognition / SageMaker)</th></tr></thead><tbody>{rows}</tbody></table></div>
-<p class="caption">Same held-out images for both models. The heatmaps show where this model found evidence; they
-explain its decision, not a guaranteed defect outline.</p>
-<p class="legend"><span>Less evidence</span><span class="ramp"></span><span>More evidence for a defect</span></p>
-<div class="tabs" id="htabs" role="group" aria-label="Dataset"></div>
-<div class="tabs" id="hfilters" role="group" aria-label="Show"></div>
-<p class="count" id="hcount"></p>
-<div class="gallery" id="hgallery"></div>
-</div></section>
-'''
+        r, c = d["holdout"]["summary"], d["cnn"]["summary"]
+        pos_n, neg_n = r["true_positive"] + r["false_negative"], r["false_positive"] + r["true_negative"]
+        rows += (f'<tr><td>{esc(d["ds"]["title"].capitalize())}<small>{r["images"]} held-out images</small></td>'
+                 f'<td>{pct(r["accuracy"], 1)}</td><td>{pct(c["accuracy"], 1)}</td>'
+                 f'<td>{r["false_negative"]} / {c["false_negative"]}<small>of {pos_n}</small></td>'
+                 f'<td>{r["false_positive"]} / {c["false_positive"]}<small>of {neg_n}</small></td></tr>')
+    return (f'<h3>Side by side</h3><div class="tablewrap"><table class="eval compare"><thead><tr><th>Dataset</th>'
+            f'<th>Amazon Rekognition</th><th>Our own CNN</th><th>Missed (Rekognition / CNN)</th>'
+            f'<th>False rejects (Rekognition / CNN)</th></tr></thead><tbody>{rows}</tbody></table></div>'
+            f'<p class="caption">Accuracy on the same held-out images for both models, trained on the same training '
+            f'images.</p>')
+
+
+def cnn_details(d):
+    c = d["cnn"]
+    if not c:
+        return '<p class="pending">Not run yet.</p>'
+    m = c["metrics"]
+    lat = m.get("latency_ms", {})
+    speed = []
+    if "gpu" in lat:
+        speed.append(f'{lat["gpu"]:.1f} ms on the GPU')
+    if "cpu" in lat:
+        speed.append(f'{lat["cpu"]:.1f} ms on the CPU')
+    rows = [("Trained", cnn_where(m)), ("Training images", f'{m.get("train_images", "–")}'),
+            ("Training time", f'{m["train_seconds"]:.0f} seconds, {m["epochs"]} passes over the images'
+             if "train_seconds" in m else "–"),
+            ("Pass kept", f'{m.get("best_epoch", "–")} of {m["epochs"]} (best test-set accuracy, '
+                          f'{pct(m["best_test_accuracy"], 1)})'),
+            ("Time to classify one image", ", ".join(speed) or "–")]
+    return ('<div class="tablewrap"><table class="eval"><tbody>' + "".join(
+        f'<tr><th>{esc(a)}</th><td>{esc(b)}</td></tr>' for a, b in rows) + '</tbody></table></div>')
+
+
+def slab(x, cy, w, h, depth, cls):
+    """A 3D-looking block: front face plus top and side faces, for one stage of the network."""
+    top, d = cy - h / 2, depth
+    return (f'<path class="{cls} side" d="M{x + w},{top} l{d},{-d} v{h} l{-d},{d} z"/>'
+            f'<path class="{cls} top" d="M{x},{top} l{d},{-d} h{w} l{-d},{d} z"/>'
+            f'<rect class="{cls}" x="{x}" y="{top}" width="{w}" height="{h}"/>')
+
+
+def network_diagram(data):
+    """Our ResNet-18, drawn left to right with one real held-out casting and its Grad-CAM heatmap."""
+    d = next((d for d in data if d["cnn"] and d["name"] == "casting"), None) or next((d for d in data if d["cnn"]), None)
+    if not d:
+        return ""
+    pos, neg = d["ds"]["positive"], d["ds"]["negative"]
+    hits = [r for r in d["cnn"]["rows"] if r["truth"] == pos and r["ok"]]
+    if not hits:
+        return ""
+    ex = max(hits, key=lambda r: r["evidence"])
+    p_pos = float(ex["conf"]) if ex["pred"] == pos else 100 - float(ex["conf"])
+    cy = 165
+    stages = [  # (x, width, height, grid, filters, what it tends to respond to)
+        (238, 14, 124, "56×56", 64, "edges, spots"),
+        (318, 22, 94, "28×28", 128, "textures"),
+        (406, 34, 66, "14×14", 256, "shapes, parts"),
+        (510, 52, 40, "7×7", 512, "defect-like|patterns"),
+    ]
+    s = []
+    arrow = lambda x1, x2: f'<path class="flow" d="M{x1},{cy} H{x2}" marker-end="url(#arr)"/>'
+    # Input photo
+    s.append(f'<image href="{esc(ex["src"])}" x="16" y="{cy - 62}" width="124" height="124" '
+             f'preserveAspectRatio="xMidYMid slice"/><rect class="frame" x="16" y="{cy - 62}" width="124" height="124"/>')
+    s.append(f'<text x="78" y="{cy + 82}" class="c b">Photo in</text>'
+             f'<text x="78" y="{cy + 98}" class="c m">resized to 224 × 224</text>')
+    s.append(arrow(144, 168))
+    # First convolution
+    s.append(slab(172, cy, 10, 140, 8, "stem"))
+    s.append(f'<text x="182" y="{cy + 98}" class="c m">first filters</text>')
+    s.append(arrow(194, 232))
+    # Four stages
+    prev_end = None
+    for i, (x, w, h, grid, filt, what) in enumerate(stages, 1):
+        if prev_end:
+            s.append(arrow(prev_end, x - 4))
+        s.append(slab(x, cy, w, h, 10, f"st{i}"))
+        mid = x + w / 2 + 5
+        s.append(f'<text x="{mid}" y="{cy - h / 2 - 18}" class="c b">Stage {i}</text>'
+                 f'<text x="{mid}" y="{cy + h / 2 + 22}" class="c">{grid} · {filt}</text>'
+                 + "".join(f'<text x="{mid}" y="{cy + h / 2 + 38 + 15 * k}" class="c m">{line}</text>'
+                           for k, line in enumerate(what.split("|"))))
+        prev_end = x + w + 14
+    # Average pool and final layer
+    s.append(arrow(prev_end, 600))
+    s.append(f'<rect class="pool" x="604" y="{cy - 40}" width="12" height="80"/>'
+             f'<text x="610" y="{cy - 52}" class="c b">Average</text>'
+             f'<text x="610" y="{cy + 58}" class="c">512</text><text x="610" y="{cy + 74}" class="c m">numbers</text>')
+    s.append(arrow(620, 648))
+    s.append(f'<rect class="fc" x="652" y="{cy - 26}" width="40" height="52" rx="6"/>'
+             f'<text x="672" y="{cy + 5}" class="c b inv">512→2</text>'
+             f'<text x="672" y="{cy - 38}" class="c b">Final layer</text>')
+    s.append(arrow(696, 722))
+    # Verdict bars
+    for j, (label, p) in enumerate(((pos, p_pos), (neg, 100 - p_pos))):
+        y = cy - 34 + j * 40
+        s.append(f'<text x="728" y="{y}" class="m">{esc(label)}</text>'
+                 f'<rect class="track" x="728" y="{y + 6}" width="120" height="14" rx="3"/>'
+                 f'<rect class="{"bar-pos" if j == 0 else "bar-neg"}" x="728" y="{y + 6}" '
+                 f'width="{max(1.5, 1.2 * p):.1f}" height="14" rx="3"/>'
+                 f'<text x="856" y="{y + 18}" class="b">{p:.0f}%</text>')
+    s.append(f'<text x="728" y="{cy - 56}" class="b">Verdict</text>')
+    # Grad-CAM branch from stage 4 to the heatmap
+    x4 = stages[-1][0] + stages[-1][2] / 2
+    s.append(f'<path class="cam" d="M{x4},{cy + 62} V{cy + 140} H{972} V{cy + 66}" marker-end="url(#arr2)"/>'
+             f'<text x="{(x4 + 972) / 2}" y="{cy + 134}" class="c cam-t">Grad-CAM: which spots in stage 4 pushed '
+             f'the verdict toward "{esc(pos)}"</text>')
+    s.append(f'<image href="{esc(ex["src"])}" x="910" y="{cy - 62}" width="124" height="124" '
+             f'preserveAspectRatio="xMidYMid slice"/>'
+             f'<image href="{esc(ex["heat"])}" x="910" y="{cy - 62}" width="124" height="124" '
+             f'preserveAspectRatio="xMidYMid slice"/><rect class="frame" x="910" y="{cy - 62}" width="124" height="124"/>'
+             f'<text x="972" y="{cy - 74}" class="c b">Where it looked</text>')
+    # Brackets: what was pre-trained vs new
+    s.append('<path class="brk" d="M172,36 v-8 H572 v8"/>'
+             '<text x="372" y="18" class="c m">Pre-trained on ImageNet (everyday photos), then fine-tuned on our photos</text>'
+             '<path class="brk" d="M652,36 v-8 H692 v8"/><text x="672" y="18" class="c m">New for our task</text>')
+    svg = ('<svg class="netfig" viewBox="0 0 1050 330" role="img" aria-labelledby="nettitle netdesc">'
+           '<title id="nettitle">Our ResNet-18 network, from photo to verdict and heatmap</title>'
+           f'<desc id="netdesc">A held-out {esc(d["ds"]["title"][:-1])} photo enters the network, passes a first set of '
+           'filters and four stages that shrink the image from 56 by 56 to 7 by 7 while growing from 64 to 512 '
+           f'filters, is averaged into 512 numbers, and a final layer outputs {esc(pos)} {p_pos:.0f} percent. '
+           'Grad-CAM reads stage 4 to draw the heatmap of where the model looked.</desc>'
+           '<defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" '
+           'orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker>'
+           '<marker id="arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" '
+           'orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="camhead"/></marker></defs>'
+           + "".join(s) + '</svg>')
+    return (f'<h3>Inside our network</h3><p class="sub">One real held-out {esc(d["ds"]["title"][:-1])}, start to '
+            'finish. Each stage is a set of learned filters that slide across the image: early stages respond to '
+            'simple things like edges and spots, later ones to larger patterns. The image gets smaller at each stage '
+            'while the number of filters grows. The descriptions under each stage are the typical roles in networks '
+            'like this, not something measured here.</p>'
+            f'<div class="netwrap">{svg}</div>'
+            '<p class="caption">ResNet-18: 18 layers with learned weights (1 first layer, 16 in the four stages, 1 final '
+            'layer), about 11.2 million numbers in all, every one adjusted during training. Inside each stage, '
+            '"shortcut" connections (not drawn) let the signal skip ahead, which is what lets deep networks like this '
+            'train well.</p>')
+
+
+def edge_note(data):
+    """One measured speed line for the robot-cell section, if our CNN has run."""
+    for d in data:
+        lat = (d["cnn"] or {}).get("metrics", {}).get("latency_ms", {})
+        if lat:
+            parts = [f'{lat["gpu"]:.0f} ms with a {d["cnn"]["metrics"]["hardware"]}' if "gpu" in lat else "",
+                     f'{lat["cpu"]:.0f} ms on the CPU alone' if "cpu" in lat else ""]
+            return (' <i>Measured here:</i> our own CNN classifies one image in about '
+                    + " and ".join(p for p in parts if p) + ', with no network involved.')
+    return ""
 
 
 def gallery_data(data):
@@ -349,9 +491,39 @@ border:1px solid rgba(255,255,255,.35);border-radius:999px;width:48px;height:48p
 ul.points{padding-left:20px;max-width:800px}ul.points li{margin:6px 0}
 footer{padding:28px 0 48px;font-size:13px;color:var(--muted)}
 .count{color:var(--muted);font-size:14px;margin:0 0 12px}
+body[data-model=rek] .m-cnn,body[data-model=cnn] .m-rek{display:none}
+.modelbar{position:sticky;top:0;z-index:5;background:var(--surface);border-bottom:2px solid var(--line);
+box-shadow:0 2px 8px rgba(0,0,0,.08)}
+.modelbar .wrap{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding-top:10px;padding-bottom:10px}
+.modelbar .label{font-weight:700;font-size:14px}
+.modelbar .tabs{margin:0}
+.modelbar .tabs button{font-size:15px;padding:8px 16px}
+.modelbar .what{font-size:13px;color:var(--muted);flex-basis:100%}
+.compare td small{display:block;font-size:12px;color:var(--muted)}
+.compare td:nth-child(2),.compare td:nth-child(3){font-weight:700}
+.netwrap{overflow-x:auto;-webkit-overflow-scrolling:touch;background:var(--surface);border:1px solid var(--line);
+border-radius:10px;padding:12px 8px}
+.netfig{display:block;width:100%;min-width:760px;height:auto}
+.netfig text{font:13px system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;fill:var(--ink)}
+.netfig .c{text-anchor:middle}.netfig .b{font-weight:700}.netfig .m{fill:var(--muted);font-size:12px}
+.netfig .inv{fill:#fff}
+.netfig .frame{fill:none;stroke:var(--line);stroke-width:1.5}
+.netfig .flow{stroke:var(--muted);stroke-width:2;fill:none}.netfig .arrowhead{fill:var(--muted)}
+.netfig .cam{stroke:#e8590c;stroke-width:2;stroke-dasharray:6 4;fill:none}.netfig .camhead{fill:#e8590c}
+.netfig .cam-t{fill:#c2410c;font-weight:600;font-size:12px}
+.netfig .brk{fill:none;stroke:var(--muted);stroke-width:1.5}
+.netfig .stem,.netfig .st1,.netfig .st2,.netfig .st3,.netfig .st4{stroke:var(--hero);stroke-width:1}
+.netfig .stem{fill:#9db8e8}.netfig .st1{fill:#7fa6ea}.netfig .st2{fill:#5a8de6}.netfig .st3{fill:#3874e0}
+.netfig .st4{fill:#0b5fe0}
+.netfig .top{filter:brightness(1.18)}.netfig .side{filter:brightness(.78)}
+.netfig .pool{fill:var(--neg)}.netfig .fc{fill:var(--hero);stroke:var(--line)}
+.netfig .track{fill:var(--track);stroke:var(--line)}.netfig .bar-pos{fill:var(--bad)}.netfig .bar-neg{fill:var(--neg)}
+@media (prefers-color-scheme:dark){.netfig .cam-t{fill:#ff9f5a}.netfig .fc{fill:#1d3a66}}
+.badge{display:inline-block;font-size:12px;font-weight:700;padding:2px 8px;border-radius:999px;border:1px solid var(--line);
+background:var(--track);color:var(--ink);vertical-align:middle;margin-left:6px}
 </style>
 </head>
-<body>
+<body data-model="rek">
 <header><div class="wrap">
 <h1>__TITLE__</h1>
 <p class="lede">A pass/fail camera check of the kind a robot cell runs: train a custom vision model on labeled
@@ -359,12 +531,13 @@ photos, then measure it on images it has never seen, counting missed defects and
 <p class="meta">Two datasets: cast pump impellers (main run) and damaged vs intact shipping cases ·
 <a href="__REPO__">Source code on GitHub</a> · Built __DATE__</p>
 </div></header>
-
+__MODELBAR__
 <section><div class="wrap">
-<h2>Results on held-out images</h2>
+<h2>Results on held-out images <span class="badge m-rek">Amazon Rekognition</span><span class="badge m-cnn">Our own CNN</span></h2>
 <p class="sub">Each model was tested on photos kept aside from training and from AWS's own evaluation, so these
 numbers show how it does on parts it has truly never seen.</p>
 __KPIS__
+__COMPARE__
 </div></section>
 
 <section><div class="wrap">
@@ -375,22 +548,38 @@ __BASELINE__
 </div></section>
 
 <section><div class="wrap">
-<h2>The custom model</h2>
+<h2>The custom model <span class="badge m-rek">Amazon Rekognition</span><span class="badge m-cnn">Our own CNN</span></h2>
+<div class="m-rek">
 <p class="sub">Rekognition Custom Labels, trained on labeled images, then tested on separate held-out images.
-On a line, a missed defect and a false reject cost different things, so they are shown separately.</p>
+AWS chooses and tunes the model itself and does not publish its design. On a line, a missed defect and a false
+reject cost different things, so they are shown separately.</p>
 __MODEL__
+</div>
+__CNN_MODEL__
 </div></section>
 
 <section><div class="wrap">
-<h2>Every held-out image</h2>
+<h2>Every held-out image <span class="badge m-rek">Amazon Rekognition</span><span class="badge m-cnn">Our own CNN</span></h2>
+<div class="m-rek">
 <p class="sub">The model's verdict and confidence for each image it was tested on. Images are shown unmodified;
 the verdict sits beside them.</p>
 <div class="tabs" id="gtabs" role="group" aria-label="Dataset"></div>
 <div class="tabs" id="gfilters" role="group" aria-label="Show"></div>
 <p class="count" id="gcount"></p>
 <div class="gallery" id="gallery"></div>
+</div>
+<div class="m-cnn">
+<p class="sub">Our CNN's verdict for each held-out image, with a Grad-CAM heatmap: the parts of the photo that
+pushed it toward __POS_WORDS__. The heat is a separate layer over the unmodified photo; switch it off to compare.
+It shows where the model found evidence, not a traced outline of the defect.</p>
+<p class="legend"><span>Less evidence</span><span class="ramp"></span><span>More evidence for a defect</span></p>
+<div class="tabs" id="htabs" role="group" aria-label="Dataset"></div>
+<div class="tabs" id="hfilters" role="group" aria-label="Show"></div>
+<p class="count" id="hcount"></p>
+<div class="gallery" id="hgallery"></div>
+</div>
 </div></section>
-__HEAT_SECTION__
+
 <section><div class="wrap">
 <h2>From demo to robot cell</h2>
 <p class="sub">How the same approach would fit a production inspection station.</p>
@@ -403,7 +592,7 @@ __HEAT_SECTION__
 <ul class="points">
 <li><b>Train in the cloud, decide on the line.</b> A cloud call adds network delay, often a few hundred
 milliseconds, which can be too slow for a fast conveyor. The cloud is a quick, cheap way to collect data, train and
-prove a model; production checks typically run on vision built into the cell.</li>
+prove a model; production checks typically run on vision built into the cell.__EDGE_NOTE__</li>
 <li><b>Running cost.</b> A hosted Custom Labels model bills about $4 an hour while running, roughly $35,000 a year
 around the clock. Fine for a pilot, but a reason to run inference at the edge in production.</li>
 <li><b>Train on the customer's parts.</b> Accuracy depends on photos that match the real station: same camera,
@@ -424,6 +613,7 @@ flipping and shifting them. A rotated copy of a training part can still appear a
 100% result may be partly flattered. A fair production test uses parts the model has never seen at any angle.</li>
 <li>Packages: 581 photos pooled and split 65/20/15 into train, test and held out with a fixed seed, after removing
 exact duplicates.</li>
+__CNN_METHOD__
 <li>Costs for the whole project: a few dollars of AWS credits for training and testing. Models are stopped when not
 in use.</li>
 __CREDITS__
@@ -535,6 +725,15 @@ viewer.addEventListener("close", () => { if (opener) opener.focus(); });
 
 const verdictShown = makeGallery(ITEMS, {tabs: "gtabs", filters: "gfilters", grid: "gallery", count: "gcount"}, false);
 const heatShown = makeGallery(HEAT, {tabs: "htabs", filters: "hfilters", grid: "hgallery", count: "hcount"}, true);
+
+// Model switch: Amazon Rekognition vs our own CNN. The choice is kept in the link (#cnn) so it can be shared.
+const MODELS = [["rek", "Amazon Rekognition"], ["cnn", "Our own CNN"]], mtabs = document.getElementById("mtabs");
+function setModel(m, remember) {
+  document.body.dataset.model = m;
+  if (mtabs) mtabs.replaceChildren(...MODELS.map(([k, t]) => button(t, k === m, () => setModel(k, true))));
+  if (remember) history.replaceState(null, "", m === "cnn" ? "#cnn" : location.pathname + location.search);
+}
+setModel(mtabs && ["#cnn", "#preview-heat"].includes(location.hash) ? "cnn" : "rek", false);
 if (location.hash === "#preview-viewer" && verdictShown) show(verdictShown(), 0);
 if (location.hash === "#preview-heat" && heatShown && heatShown().length) show(heatShown(), 0, null, true);
 </script>
@@ -568,11 +767,47 @@ def main():
     # Names that must never appear on the public page, kept in the git-ignored settings.json ("private_terms").
     private_terms = local.get("private_terms", [])
 
-    kpi_html = "".join(f'<div class="ds-block"><div class="ds-title">{esc(d["ds"]["title"].capitalize())}</div>'
-                       f'{kpis(d)}</div>' for d in data)
-    base_html = "".join(f'<h3>{esc(d["ds"]["title"].capitalize())}</h3>{baseline_table(d)}' for d in data)
-    model_html = "".join(f'<h3>{esc(d["ds"]["title"].capitalize())}</h3><div class="grid2"><div>{confusion(d) or ""}'
+    title_of = lambda d: esc(d["ds"]["title"].capitalize())
+    rek_summary = lambda d: (d["holdout"] or {}).get("summary")
+    cnn_summary = lambda d: (d["cnn"] or {}).get("summary")
+    cnn_runs = [d for d in data if d["cnn"]]
+
+    kpi_html = ('<div class="m-rek">' + "".join(
+        f'<div class="ds-block"><div class="ds-title">{title_of(d)}</div>{kpis(d, rek_summary(d))}</div>'
+        for d in data) + '</div>')
+    if cnn_runs:
+        kpi_html += ('<div class="m-cnn">' + "".join(
+            f'<div class="ds-block"><div class="ds-title">{title_of(d)}</div>{kpis(d, cnn_summary(d))}</div>'
+            for d in data) + '</div>')
+    base_html = "".join(f'<h3>{title_of(d)}</h3>{baseline_table(d)}' for d in data)
+    model_html = "".join(f'<h3>{title_of(d)}</h3><div class="grid2"><div>{confusion(d, rek_summary(d))}'
                          f'</div><div>{eval_table(d)}</div></div>' for d in data)
+
+    modelbar = cnn_model = cnn_method = ""
+    if cnn_runs:
+        where = cnn_where(cnn_runs[0]["cnn"]["metrics"])
+        modelbar = (
+            '<nav class="modelbar" aria-label="Choose a model"><div class="wrap"><span class="label">Model:</span>'
+            '<div class="tabs" id="mtabs" role="group" aria-label="Model"></div>'
+            '<span class="what m-rek">Amazon Rekognition Custom Labels: a managed AWS service that picks, trains and '
+            'hosts the model for you.</span>'
+            f'<span class="what m-cnn">Our own CNN: a ResNet-18 fine-tuned on the same images, trained {esc(where)}, '
+            'with heatmaps showing where it looks.</span></div></nav>')
+        cnn_model = (
+            '<div class="m-cnn"><p class="sub">A ResNet-18 convolutional neural network, starting from weights '
+            'pre-trained on ImageNet (general photos) and fine-tuned on the same training images Rekognition used. '
+            'After each pass over the training images it was scored on the same test set, and the best pass was '
+            'kept. Then it was tested once on the held-out images. Unlike the Rekognition model, every part of it is '
+            'visible, which is what makes the heatmaps possible.</p>'
+            + network_diagram(data)
+            + "".join(f'<h3>{title_of(d)}</h3><div class="grid2"><div>{confusion(d, cnn_summary(d))}</div>'
+                      f'<div>{cnn_details(d)}</div></div>' for d in data) + '</div>')
+        cnn_method = (f'<li>Our own CNN: ResNet-18 (PyTorch, ImageNet starting weights), fine-tuned {esc(where)} on '
+                      'the same training images, with the same test and held-out images. Images resized to 224×224; '
+                      'training used random flips, small rotations and brightness changes. Heatmaps: Grad-CAM on the '
+                      'last convolutional block, for the defect class, on one shared scale per dataset so a clean '
+                      'part stays mostly clear.</li>')
+    pos_words = " / ".join(f'"{esc(d["ds"]["positive"])}"' for d in cnn_runs) or '"defective"'
     credits_html = "".join(f'<li>{esc(d["ds"]["title"].capitalize())}: <a href="{esc(CREDITS[d["name"]][1])}">'
                            f'{esc(CREDITS[d["name"]][0])}</a>, licensed <a href="{esc(CREDITS[d["name"]][3])}">'
                            f'{esc(CREDITS[d["name"]][2])}</a>.</li>' for d in data)
@@ -580,17 +815,25 @@ def main():
     names = [[d["name"], d["ds"]["title"].capitalize(), d["ds"]["positive"], d["ds"]["negative"]]
              for d in data if d["holdout"]]
 
-    used_sagemaker = any(d["sm"] for d in data)
-    title = ("Automated visual inspection with Amazon Rekognition and Amazon SageMaker AI" if used_sagemaker
-             else "Automated visual inspection with Amazon Rekognition")
-    built_with = ("Built with Amazon Rekognition Custom Labels, Amazon SageMaker AI and Amazon S3, hosted on AWS "
-                  "Amplify Hosting." if used_sagemaker else
-                  "Built with Amazon Rekognition Custom Labels and Amazon S3, hosted on AWS Amplify Hosting.")
+    used_sagemaker = any(d["cnn"]["metrics"].get("trained_on") == "Amazon SageMaker AI" for d in cnn_runs)
+    if used_sagemaker:
+        title = "Automated visual inspection with Amazon Rekognition and Amazon SageMaker AI"
+        built_with = ("Built with Amazon Rekognition Custom Labels, Amazon SageMaker AI (PyTorch) and Amazon S3, "
+                      "hosted on AWS Amplify Hosting.")
+    elif cnn_runs:
+        title = "Automated visual inspection: Amazon Rekognition vs. our own CNN"
+        built_with = ("Built with Amazon Rekognition Custom Labels, Amazon S3 and PyTorch, hosted on AWS Amplify "
+                      "Hosting.")
+    else:
+        title = "Automated visual inspection with Amazon Rekognition"
+        built_with = "Built with Amazon Rekognition Custom Labels and Amazon S3, hosted on AWS Amplify Hosting."
 
     page = (PAGE.replace("__REPO__", REPO_URL).replace("__DATE__", date.today().strftime("%B %Y"))
             .replace("__TITLE__", title).replace("__BUILT_WITH__", built_with)
+            .replace("__MODELBAR__", modelbar).replace("__COMPARE__", compare_table(data))
             .replace("__KPIS__", kpi_html).replace("__BASELINE__", base_html).replace("__MODEL__", model_html)
-            .replace("__HEAT_SECTION__", heat_section(data))
+            .replace("__CNN_MODEL__", cnn_model).replace("__CNN_METHOD__", cnn_method)
+            .replace("__POS_WORDS__", pos_words).replace("__EDGE_NOTE__", edge_note(data))
             .replace("__CREDITS__", credits_html)
             .replace("__ITEMS__", json.dumps(items).replace("</", "<\\/"))
             .replace("__HEAT_ITEMS__", json.dumps(heat_data(data)).replace("</", "<\\/"))
@@ -604,7 +847,7 @@ def main():
             dest = SITE / im["src"]
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(im["file"], dest)  # byte-for-byte: no resizing, cropping or re-encoding
-        for r in (d["sm"] or {}).get("rows", []):
+        for r in (d["cnn"] or {}).get("rows", []):
             dest = SITE / r["heat"]
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(r["heat_file"], dest)  # separate overlay layer; the photo itself is never altered
@@ -615,7 +858,8 @@ def main():
     for d in data:
         state = ("held-out test done" if d["holdout"] else "training done" if d["eval"]
                  else "baseline only" if d["baseline"] else "nothing yet")
-        state += f", SageMaker heatmaps: {len(d['sm']['rows'])}" if d["sm"] else ", SageMaker heatmaps: not yet"
+        state += (f", our CNN: {pct(d['cnn']['summary']['accuracy'], 1)} held-out, {len(d['cnn']['rows'])} heatmaps"
+                  if d["cnn"] else ", our CNN: not run yet")
         print(f"  {d['name']}: {state}")
 
 

@@ -1,6 +1,7 @@
-"""SageMaker training script: fine-tune ResNet-18 per dataset, test on held-out images, write Grad-CAM heatmaps.
+"""Fine-tune ResNet-18 per dataset, test on held-out images, write Grad-CAM heatmaps.
 
-Runs inside the AWS PyTorch training container (also runs locally for a quick check, see --local-check).
+Runs on a local machine (uses an NVIDIA GPU when present; see train_local_cnn.py) or inside the AWS PyTorch
+training container as a SageMaker training job (see launch.py). --local-check runs a tiny smoke test.
 
 Inputs (SageMaker channels):
   images   s3://<bucket>/images/<dataset>/{train,test}/<label>/*   the same splits Rekognition used
@@ -9,7 +10,7 @@ Inputs (SageMaker channels):
 Outputs (/opt/ml/output/data, uploaded by SageMaker as output.tar.gz):
   <dataset>/predictions.json      verdict, confidence and heatmap file for every held-out image
   <dataset>/heatmaps/<image>.png  transparent overlay, same size as the original image (the original is untouched)
-  <dataset>/metrics.json          held-out accuracy, confusion matrix, training history
+  <dataset>/metrics.json          held-out accuracy, confusion matrix, training history, hardware and speed
 
 Heatmaps show Grad-CAM evidence for the positive class (defective / damaged), scaled on one shared scale per
 dataset, so a good part should look mostly clear instead of every image glowing somewhere.
@@ -17,7 +18,9 @@ dataset, so a good part should look mostly clear instead of every image glowing 
 import argparse
 import json
 import os
+import platform
 import random
+import statistics
 import time
 from pathlib import Path
 
@@ -59,14 +62,48 @@ def build_model(pretrained):
     return m
 
 
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def seed_everything(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic, torch.backends.cudnn.benchmark = True, False
+
+
+def hardware():
+    if DEVICE.type == "cuda":
+        return torch.cuda.get_device_name(0)
+    return platform.processor() or platform.machine() or "CPU"
+
+
 def evaluate(model, loader):
     model.eval()
     correct = total = 0
     with torch.no_grad():
         for x, y in loader:
-            correct += (model(x).argmax(1) == y).sum().item()
+            correct += (model(x.to(DEVICE)).argmax(1).cpu() == y).sum().item()
             total += len(y)
     return correct / max(total, 1)
+
+
+def latency_ms(model, x, device, runs=50):
+    """Median time to classify one image (batch of 1), after warm-up, the way a station checks one part at a time."""
+    model = model.to(device).eval()
+    x = x.to(device)
+    sync = torch.cuda.synchronize if device.type == "cuda" else (lambda: None)
+    times = []
+    with torch.no_grad():
+        for i in range(runs + 10):
+            sync()
+            t = time.perf_counter()
+            model(x)
+            sync()
+            if i >= 10:
+                times.append((time.perf_counter() - t) * 1000)
+    return round(statistics.median(times), 2)
 
 
 class GradCAM:
@@ -79,11 +116,11 @@ class GradCAM:
 
     def __call__(self, x, cls):
         self.model.zero_grad()
-        logits = self.model(x)
+        logits = self.model(x.to(DEVICE))
         logits[0, cls].backward()
         weights = self.grads.mean(dim=(2, 3), keepdim=True)
         cam = F.relu((weights * self.acts).sum(1))[0]
-        return cam.detach().numpy(), F.softmax(logits, 1)[0].detach().numpy()
+        return cam.detach().cpu().numpy(), F.softmax(logits, 1)[0].detach().cpu().numpy()
 
 
 def overlay_png(cam, scale, size, out_path):
@@ -117,19 +154,23 @@ def run_dataset(name, args, out_root):
                                    transforms.ToTensor(), transforms.Normalize(MEAN, STD)])
     eval_tf = transforms.Compose([transforms.Resize((224, 224)), transforms.ToTensor(),
                                   transforms.Normalize(MEAN, STD)])
+    seed_everything(42)
+    gen = torch.Generator().manual_seed(42)  # same shuffle order every run
     dl = lambda items, tf, shuffle: torch.utils.data.DataLoader(
-        ImageSet(items, tf), batch_size=args.batch_size, shuffle=shuffle, num_workers=args.workers)
+        ImageSet(items, tf), batch_size=args.batch_size, shuffle=shuffle, num_workers=args.workers,
+        generator=gen, persistent_workers=args.workers > 0, pin_memory=DEVICE.type == "cuda")
     train_dl, test_dl = dl(train, train_tf, True), dl(test, eval_tf, False)
 
-    torch.manual_seed(42)
-    model = build_model(pretrained=not args.local_check)
+    model = build_model(pretrained=not args.local_check).to(DEVICE)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
     best_acc, best_state, history = -1, None, []
+    train_began = time.time()
     for epoch in range(1, args.epochs + 1):
         model.train()
         began, seen, loss_sum = time.time(), 0, 0.0
         for x, y in train_dl:
+            x, y = x.to(DEVICE, non_blocking=True), y.to(DEVICE, non_blocking=True)
             opt.zero_grad()
             loss = F.cross_entropy(model(x), y)
             loss.backward()
@@ -142,9 +183,17 @@ def run_dataset(name, args, out_root):
         print(f"[{name}] epoch {epoch}: train_loss={loss_sum / seen:.4f} test_accuracy={acc:.4f} "
               f"({time.time() - began:.0f}s)", flush=True)
         if acc > best_acc:
-            best_acc, best_state = acc, {k: v.clone() for k, v in model.state_dict().items()}
+            best_acc, best_epoch, best_state = acc, epoch, {k: v.clone() for k, v in model.state_dict().items()}
+    train_seconds = round(time.time() - train_began, 1)
     model.load_state_dict(best_state)
     model.eval()
+
+    sample = eval_tf(Image.open(held[0][0]).convert("RGB")).unsqueeze(0)
+    speed = {"cpu": latency_ms(model, sample, torch.device("cpu"))}
+    if DEVICE.type == "cuda":
+        speed["gpu"] = latency_ms(model, sample, DEVICE)
+    model.to(DEVICE)
+    print(f"[{name}] time per image: " + ", ".join(f"{k} {v} ms" for k, v in speed.items()), flush=True)
 
     out = out_root / name
     (out / "heatmaps").mkdir(parents=True, exist_ok=True)
@@ -169,7 +218,11 @@ def run_dataset(name, args, out_root):
                       "evidence": round(float(min(c.max() / scale, 1.0)) if scale > 0 else 0.0, 3)})
     n = len(preds)
     metrics = {"dataset": name, "model": "ResNet-18 (ImageNet weights), fine-tuned", "epochs": args.epochs,
-               "best_test_accuracy": round(best_acc, 4), "heldout_images": n,
+               "best_epoch": best_epoch, "best_test_accuracy": round(best_acc, 4),
+               "train_images": len(train), "test_images": len(test), "heldout_images": n,
+               "trained_on": "Amazon SageMaker AI" if os.environ.get("SM_CURRENT_HOST") else "local",
+               "hardware": hardware(), "cpu": platform.processor() or platform.machine(),
+               "torch": torch.__version__, "train_seconds": train_seconds, "latency_ms": speed,
                "heldout_accuracy": round((cm["tp"] + cm["tn"]) / n, 4), **cm,
                "recall": round(cm["tp"] / max(cm["tp"] + cm["fn"], 1), 4),
                "precision": round(cm["tp"] / max(cm["tp"] + cm["fp"], 1), 4), "history": history}
@@ -193,6 +246,7 @@ def main():
                     help="tiny smoke test: 16 images per split, random weights, no download")
     args = ap.parse_args()
     torch.set_num_threads(max(1, os.cpu_count() or 1))
+    print(f"Device: {DEVICE} ({hardware()}), torch {torch.__version__}", flush=True)
     out_root = Path(args.output)
     for name in args.datasets.split(","):
         run_dataset(name.strip(), args, out_root)

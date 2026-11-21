@@ -8,3 +8,5 @@ __pycache__/
 site/
 site.json
 .pytest_cache/
+.venv-gpu/
+.cache/

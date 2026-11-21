@@ -237,6 +237,21 @@ def write_csv(path, rows):
     print(f"Saved {path.relative_to(ROOT)}")
 
 
+def score(rows, pos):
+    """Confusion counts for held-out rows ({"true_label", "predicted"}), with `pos` as the class a line must catch.
+
+    A row whose prediction is anything other than `pos` (including "none") counts as a pass.
+    """
+    tp = sum(r["true_label"] == pos and r["predicted"] == pos for r in rows)
+    fn = sum(r["true_label"] == pos and r["predicted"] != pos for r in rows)
+    fp = sum(r["true_label"] != pos and r["predicted"] == pos for r in rows)
+    tn = len(rows) - tp - fn - fp
+    return {"true_positive": tp, "false_negative": fn, "false_positive": fp, "true_negative": tn,
+            "precision": round(tp / (tp + fp), 3) if tp + fp else 0,
+            "recall": round(tp / (tp + fn), 3) if tp + fn else 0,
+            "accuracy": round((tp + tn) / len(rows), 3) if rows else 0}
+
+
 def pct(n, total):
     return f"{100 * n / total:.0f}%" if total else "-"
 

@@ -1,0 +1,22 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements-dev.txt
+      # The tests use small fake images and never call AWS, so no credentials or datasets are needed here.
+      - run: python -m pytest -v
+      - name: Every script at least compiles
+        run: python -m compileall -q *.py sagemaker

@@ -183,8 +183,9 @@ def eval_table(d):
     return (f'<div class="tablewrap"><table class="eval"><thead><tr><th>Label</th><th>Test images</th><th>Precision</th><th>Recall</th>'
             f'<th>F1</th></tr></thead><tbody>{rows}</tbody></table></div>'
             f'<p class="caption">AWS\'s own evaluation after training, on the {esc(e["images"])}-image test set '
-            f'(overall F1 {pct(e["f1"], 1)}). The held-out numbers above come from separate images the model never '
-            f'saw during training or evaluation.</p>')
+            f'(overall F1 {pct(e["f1"], 1)}), scored at a confidence cut-off AWS picks for each label. The held-out '
+            f'numbers above come from separate images the model never saw during training or evaluation, and simply '
+            f'take its top guess for each image.</p>')
 
 
 def heat_data(data):
@@ -418,6 +419,9 @@ at the price of more false rejects. Where a missed defect reaches a customer, th
 <ul class="points">
 <li>Casting: 1,000 training, 200 test and 100 held-out images, balanced between defective and ok. Test and
 held-out images that were byte-for-byte copies of training images (the source dataset contains a few) were removed.</li>
+<li>Limitation: the casting dataset's 7,348 photos were made by its author from 1,300 originals by rotating,
+flipping and shifting them. A rotated copy of a training part can still appear among the held-out images, so the
+100% result may be partly flattered. A fair production test uses parts the model has never seen at any angle.</li>
 <li>Packages: 581 photos pooled and split 65/20/15 into train, test and held out with a fixed seed, after removing
 exact duplicates.</li>
 <li>Costs for the whole project: a few dollars of AWS credits for training and testing. Models are stopped when not
@@ -546,10 +550,9 @@ FORBIDDEN = [
 ]
 
 
-def privacy_check(text, bucket):
+def privacy_check(text, bucket, terms=()):
+    """Exits if the page would expose AWS identifiers, the bucket name, or a private term (any letter case)."""
     problems = [why for rx, why in FORBIDDEN if rx.search(text)]
-    # Names that must never appear on the public page, kept in the git-ignored settings.json ("private_terms").
-    terms = json.loads((ROOT / "settings.json").read_text()).get("private_terms", [])
     if any(t.lower() in text.lower() for t in terms if t):
         problems.append("a term listed in private_terms")
     if bucket and bucket in text:
@@ -560,7 +563,10 @@ def privacy_check(text, bucket):
 
 def main():
     data = [load(name) for name in DATASETS]
-    bucket = json.loads((ROOT / "settings.json").read_text()).get("bucket", "")
+    local = json.loads((ROOT / "settings.json").read_text())
+    bucket = local.get("bucket", "")
+    # Names that must never appear on the public page, kept in the git-ignored settings.json ("private_terms").
+    private_terms = local.get("private_terms", [])
 
     kpi_html = "".join(f'<div class="ds-block"><div class="ds-title">{esc(d["ds"]["title"].capitalize())}</div>'
                        f'{kpis(d)}</div>' for d in data)
@@ -589,7 +595,7 @@ def main():
             .replace("__ITEMS__", json.dumps(items).replace("</", "<\\/"))
             .replace("__HEAT_ITEMS__", json.dumps(heat_data(data)).replace("</", "<\\/"))
             .replace("__NAMES__", json.dumps(names).replace("</", "<\\/")))
-    privacy_check(page, bucket)
+    privacy_check(page, bucket, private_terms)
 
     if SITE.exists():
         shutil.rmtree(SITE)

@@ -9,7 +9,7 @@ import sys
 import time
 
 from common import (INFERENCE_PER_HOUR, ROOT, client, dataset, find_project, find_version, minutes, pct,
-                    results_dir, run, settings, splits, stop_model, write_csv)
+                    results_dir, run, score, settings, splits, stop_model, write_csv)
 
 
 def main():
@@ -69,16 +69,10 @@ def main():
 
     out = results_dir()
     write_csv(out / "step3_holdout.csv", rows)
-    tp = sum(r["true_label"] == pos and r["predicted"] == pos for r in rows)
-    fn = sum(r["true_label"] == pos and r["predicted"] != pos for r in rows)
-    fp = sum(r["true_label"] != pos and r["predicted"] == pos for r in rows)
-    tn = len(rows) - tp - fn - fp
-    precision = tp / (tp + fp) if tp + fp else 0
-    recall = tp / (tp + fn) if tp + fn else 0
-    accuracy = (tp + tn) / len(rows)
-    summary = {"dataset": ds["name"], "positive_class": pos, "images": len(rows), "true_positive": tp,
-               "false_negative": fn, "false_positive": fp, "true_negative": tn, "precision": round(precision, 3),
-               "recall": round(recall, 3), "accuracy": round(accuracy, 3)}
+    counts = score(rows, pos)
+    tp, fn, fp, tn = (counts[k] for k in ("true_positive", "false_negative", "false_positive", "true_negative"))
+    precision, recall = counts["precision"], counts["recall"]
+    summary = {"dataset": ds["name"], "positive_class": pos, "images": len(rows), **counts}
     (out / "step3_summary.json").write_text(json.dumps(summary, indent=2))
 
     print(f"\nHeld-out results ({len(rows)} {ds['title']} the model never saw), '{pos}' as the positive class:")

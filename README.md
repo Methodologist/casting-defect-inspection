@@ -1,5 +1,7 @@
 # Casting defect inspection with Amazon Rekognition
 
+[![tests](https://github.com/Methodologist/casting-defect-inspection/actions/workflows/tests.yml/badge.svg)](https://github.com/Methodologist/casting-defect-inspection/actions/workflows/tests.yml)
+
 > **Showcase project.** A portfolio demonstration of camera-based pass/fail inspection on AWS, built on public
 > datasets. It is not a production system and is not maintained as a library.
 >
@@ -12,10 +14,14 @@
 
 Measured on held-out images the model never saw during training or AWS's own evaluation.
 
-| Dataset | Held-out accuracy | Defects missed | Good items rejected | AWS test-set F1 |
+| Dataset | Held-out accuracy | Defects missed | Good items rejected | AWS test-set F1* |
 |---|---|---|---|---|
 | Cast pump impellers | **100%** (100 images) | 0 of 50 | 0 of 50 | 100% (200 images) |
 | Shipping cases, damaged vs intact | **88.6%** (88 images) | 6 of 39 | 4 of 49 | 95.7% (116 images) |
+
+\* AWS reports F1 at a confidence cut-off it picks for each label after training. Its confusion matrix for the
+same casting test set is not quite perfect: it shows 2 of the 100 defective castings labeled "ok". The held-out
+columns simply take the model's top guess for each image.
 
 - **Off-the-shelf AI isn't an inspector:** general Rekognition labels (coil, rotor, spoke) appear on good and
   defective castings alike.
@@ -26,6 +32,19 @@ Measured on held-out images the model never saw during training or AWS's own eva
   production model is trained on consistent photos from the real station.
 
 The whole project used about $3 to $4 of AWS credits; models are stopped as soon as each test ends.
+
+## Known limitations
+
+- **The casting photos include rotated and flipped copies.** The dataset's 7,348 photos were made by its author
+  from 1,300 originals (781 defective, 519 ok) by rotating, flipping and shifting them. Exact copies are removed
+  here, but a rotated copy of a training part can still appear in the test or held-out set, so some of the 100% may
+  come from recognizing a part seen at another angle. A fair production test uses parts the model has never seen
+  in any orientation.
+- **The model gives a verdict, not a location.** It learns which visual patterns go with each label, not what a
+  defect is, and can't say which part of the photo it based its call on. The shipping-case results show why that
+  matters: it partly learned box type instead of damage. The next step below adds heatmaps to check this.
+- **Public datasets only.** Neither dataset comes from a real inspection station's camera, lighting or reject
+  criteria, and the casting license is non-commercial.
 
 ## About the project
 
@@ -138,9 +157,9 @@ link. Re-running it publishes the current build to the same link.
 .venv\Scripts\python deploy_site.py
 ```
 
-## Phase 2: where the model looks (SageMaker, in progress)
+## Next step: where the model looks (SageMaker)
 
-`sagemaker/` holds a second experiment: fine-tune a ResNet-18 on the same training images in an Amazon
+Not run yet. `sagemaker/` holds the planned second experiment: fine-tune a ResNet-18 on the same training images in an Amazon
 SageMaker AI training job, test it on the same held-out images, and draw a Grad-CAM heatmap for each one,
 showing which parts of the photo pushed the model toward "defective" or "damaged". The results site adds a
 heatmap library (heat drawn as a separate, switchable layer over the unmodified photo) once real results exist.
@@ -155,7 +174,24 @@ heatmap library (heat drawn as a separate, switchable layer over the unmodified 
 ```
 
 New AWS accounts start with a SageMaker training quota of 0; request "ml.m5.xlarge for training job usage" = 1
-in Service Quotas first. Status: the code is written and checked locally; the cloud run is waiting on that quota.
+in Service Quotas first. The training and heatmap code is written and has been checked locally on a small sample;
+the cloud run is planned once that quota is granted.
+
+## Tests
+
+`tests/` checks the parts a wrong result would come from, without AWS or the datasets (it builds small fake
+image folders on the fly). GitHub Actions runs it on every push.
+
+- **The split:** copies of training images never reach the test or held-out sets, the sets never overlap, the
+  same split comes out every run, and the unsplit copy of the casting dataset is ignored.
+- **Scoring:** missed defects and false rejects are counted separately, and a "no label" answer counts as a pass.
+- **The site's privacy check:** account IDs, ARNs, S3 paths, the bucket name and private terms are blocked.
+- **The training manifest** matches the format Rekognition Custom Labels reads.
+
+```powershell
+.venv\Scripts\pip install -r requirements-dev.txt
+.venv\Scripts\python -m pytest
+```
 
 ## Cleaning up
 

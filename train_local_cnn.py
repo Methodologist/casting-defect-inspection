@@ -3,7 +3,8 @@
 1. Copies each dataset's train / test / held-out images (from common.splits(), the same split as steps 2 and 3)
    into data/_staged/.
 2. Runs sagemaker/job/train_gradcam.py with the GPU environment in .venv-gpu (an NVIDIA GPU is used if present).
-3. Saves predictions, metrics and heatmaps to results/<dataset>/cnn/.
+3. Saves predictions, metrics, heatmaps and the trained weights to results/<dataset>/cnn/, then draws the
+   feature maps for the site's network diagram (sagemaker/job/layer_maps.py) into results/<dataset>/cnn/layers/.
 
 No AWS calls, no cost. Downloads (the ImageNet starting weights) go to .cache/ in this folder.
 
@@ -23,6 +24,7 @@ STAGE = ROOT / "data" / "_staged"
 OUT = ROOT / "data" / "_cnn_output"
 GPU_PYTHON = ROOT / ".venv-gpu" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 JOB = ROOT / "sagemaker" / "job" / "train_gradcam.py"
+LAYER_MAPS = ROOT / "sagemaker" / "job" / "layer_maps.py"
 
 
 def stage(name):
@@ -63,6 +65,9 @@ def main():
         shutil.rmtree(dest, ignore_errors=True)
         shutil.copytree(OUT / name, dest)
         print(f"Saved results/{name}/cnn/")
+        # Feature maps for the site's "Inside our network" diagram.
+        subprocess.run([str(GPU_PYTHON), "-I", str(LAYER_MAPS), str(dest), str(STAGE / "heldout" / name)],
+                       env=env, check=True)
     print("Next: python build_site.py, then python deploy_site.py")
 
 

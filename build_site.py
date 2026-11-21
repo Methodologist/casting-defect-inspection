@@ -10,13 +10,15 @@ import json
 import re
 import shutil
 import sys
+import urllib.request
 from datetime import date
 
 import common
 from common import DATASETS, ROOT
 
 SITE = ROOT / "site"
-REPO_URL = "https://github.com/Methodologist/casting-defect-inspection"
+GITHUB_USER = "Methodologist"
+REPO_URL = f"https://github.com/{GITHUB_USER}/casting-defect-inspection"
 
 CREDITS = {
     "casting": ('"casting product image data for quality inspection" by Ravirajsinh Dabhi, Kaggle',
@@ -38,6 +40,29 @@ BASELINE_NOTES = {
                  "by learning \"brown carton\" instead of \"damage\", so its results below deserve skepticism, and "
                  "a production system would be trained on the customer's own cases, photographed in the cell."),
 }
+
+
+def github_profile():
+    """The author's public GitHub name and photo, looked up when the site is built (falls back to the login)."""
+    p = {"name": GITHUB_USER, "url": f"https://github.com/{GITHUB_USER}",
+         "avatar": f"https://github.com/{GITHUB_USER}.png?size=96"}
+    try:
+        req = urllib.request.Request(f"https://api.github.com/users/{GITHUB_USER}",
+                                     headers={"Accept": "application/vnd.github+json", "User-Agent": "build-site"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.load(r)
+        p["name"] = data.get("name") or GITHUB_USER
+        if data.get("avatar_url"):
+            p["avatar"] = data["avatar_url"] + ("&" if "?" in data["avatar_url"] else "?") + "s=96"
+    except (OSError, ValueError):
+        print("Could not reach GitHub for the profile name; using the login instead.")
+    return p
+
+
+def author_badge(p):
+    return (f'<a class="author" href="{esc(p["url"])}" rel="author">'
+            f'<img src="{esc(p["avatar"])}" alt="" width="38" height="38">'
+            f'<span><b>{esc(p["name"])}</b><small>github.com/{esc(GITHUB_USER)}</small></span></a>')
 
 
 def esc(x):
@@ -120,7 +145,10 @@ def load(name):
                "false_negative": metrics["fn"], "false_positive": metrics["fp"], "true_negative": metrics["tn"],
                "accuracy": metrics["heldout_accuracy"], "recall": metrics["recall"],
                "precision": metrics["precision"]}
-    d["cnn"] = {"metrics": metrics, "rows": rows, "summary": summary}
+    layers = read_json(cnn_dir / "layers" / "layers.json")
+    if layers and layers["file"] not in srcs:
+        layers = None
+    d["cnn"] = {"metrics": metrics, "rows": rows, "summary": summary, "dir": cnn_dir, "layers": layers}
     return d
 
 
@@ -258,110 +286,96 @@ def cnn_details(d):
         f'<tr><th>{esc(a)}</th><td>{esc(b)}</td></tr>' for a, b in rows) + '</tbody></table></div>')
 
 
-def slab(x, cy, w, h, depth, cls):
-    """A 3D-looking block: front face plus top and side faces, for one stage of the network."""
-    top, d = cy - h / 2, depth
-    return (f'<path class="{cls} side" d="M{x + w},{top} l{d},{-d} v{h} l{-d},{d} z"/>'
-            f'<path class="{cls} top" d="M{x},{top} l{d},{-d} h{w} l{-d},{d} z"/>'
-            f'<rect class="{cls}" x="{x}" y="{top}" width="{w}" height="{h}"/>')
+# (stage key, title, learned numbers, what it does, what the pictures show). The "Here:" notes describe the feature
+# maps drawn for the current casting example (results/casting/cnn/layers); re-check them if the model is retrained.
+LAYER_STEPS = [
+    ("maxpool", "First filters", "9.5 thousand",
+     "64 simple detectors slide over the photo, each looking for one basic thing: an edge at some angle, a "
+     "light-to-dark change, a spot. The image is then halved twice in size.",
+     "Here: overall brightness and the outlines of the rings."),
+    ("layer1", "Stage 1", "148 thousand",
+     "Combines those edges into slightly richer patterns: corners, short curves, fine texture.",
+     "Here: fine edges and the machining marks on the metal."),
+    ("layer2", "Stage 2", "526 thousand",
+     "Halves the image again and doubles the detectors to 128. Typically responds to surface texture: smooth "
+     "metal versus rough or pitted.",
+     "Here: fewer, sparser responses. Most of the part looks normal."),
+    ("layer3", "Stage 3", "2.1 million",
+     "Halves again, 256 detectors. Each spot now covers a larger area, so it can respond to larger shapes: the "
+     "rim, the hub, a dent.",
+     "Here: single bright spots, including one on the notch in the rim."),
+    ("layer4", "Stage 4", "8.4 million",
+     "The last and largest stage: 512 detectors on a 7×7 grid. After our training, some of them respond to "
+     "defect-like patterns. Each of the 49 spots covers a big chunk of the photo.",
+     "These four are the maps that pushed hardest toward \"{pos}\": all lit up on the damaged side."),
+]
 
 
-def network_diagram(data):
-    """Our ResNet-18, drawn left to right with one real held-out casting and its Grad-CAM heatmap."""
-    d = next((d for d in data if d["cnn"] and d["name"] == "casting"), None) or next((d for d in data if d["cnn"]), None)
+def network_cards(data):
+    """Inside our network: one real held-out image, step by step, with the real feature maps from each stage."""
+    d = next((d for d in data if d["cnn"] and d["cnn"]["layers"] and d["name"] == "casting"), None) or \
+        next((d for d in data if d["cnn"] and d["cnn"]["layers"]), None)
     if not d:
         return ""
-    pos, neg = d["ds"]["positive"], d["ds"]["negative"]
-    hits = [r for r in d["cnn"]["rows"] if r["truth"] == pos and r["ok"]]
-    if not hits:
-        return ""
-    ex = max(hits, key=lambda r: r["evidence"])
-    p_pos = float(ex["conf"]) if ex["pred"] == pos else 100 - float(ex["conf"])
-    cy = 165
-    stages = [  # (x, width, height, grid, filters, what it tends to respond to)
-        (238, 14, 124, "56×56", 64, "edges, spots"),
-        (318, 22, 94, "28×28", 128, "textures"),
-        (406, 34, 66, "14×14", 256, "shapes, parts"),
-        (510, 52, 40, "7×7", 512, "defect-like|patterns"),
+    lay, rows = d["cnn"]["layers"], d["cnn"]["rows"]
+    pos, neg = lay["positive"], lay["negative"]
+    ex = next(r for r in rows if r["src"].endswith("/" + lay["file"]))
+    thing = d["ds"]["title"][:-1]  # "cast pump impeller"
+    pretrained = '<span class="ptag">pre-trained, then fine-tuned</span>'
+    cards = [f'<li class="pcard"><div class="ph"><span class="pn">1</span><b>Photo in</b></div>'
+             f'<img src="{esc(ex["src"])}" alt="The held-out {esc(thing)} photo" loading="lazy">'
+             f'<div class="pdim">224 × 224 pixels · 3 colors</div>'
+             f'<p>A held-out photo the network never trained on, resized, with its brightness values adjusted to the '
+             f'range the network learned from.</p></li>']
+    for n, (key, title, weights, does, shows) in enumerate(LAYER_STEPS, 2):
+        st = lay["stages"][key]
+        cards.append(
+            f'<li class="pcard"><div class="ph"><span class="pn">{n}</span><b>{esc(title)}</b>{pretrained}</div>'
+            f'<img class="maps" src="net/{d["name"]}/{key}.png" alt="Four of the {st["maps"]} feature maps from '
+            f'{esc(title.lower())}, each {st["size"]} by {st["size"]}" loading="lazy">'
+            f'<div class="pdim">{st["size"]}×{st["size"]} grid · {st["maps"]} maps · {weights} learned numbers</div>'
+            f'<p>{esc(does)}</p><p class="pshow">{esc(shows.format(pos=pos))}</p></li>')
+    p_pos = 100 * lay["probs"][pos]
+    cards.append(
+        f'<li class="pcard"><div class="ph"><span class="pn">7</span><b>Average, then vote</b>'
+        f'<span class="ptag new">new for our task</span></div>'
+        f'<img class="maps" src="net/{d["name"]}/pooled.png" alt="512 averaged values, one square each" '
+        f'loading="lazy"><div class="pdim">512 numbers → 2 scores · 1,026 learned numbers</div>'
+        f'<p>Each of stage 4\'s 512 maps is averaged into one number: how much of that pattern is in the photo, '
+        f'anywhere (one square each above). The final layer is a weighted vote: each number pushes toward '
+        f'"{esc(pos)}" or "{esc(neg)}".</p><p class="pshow">This layer replaced the original one, which chose among '
+        f'1,000 everyday categories.</p></li>')
+    cards.append(
+        f'<li class="pcard"><div class="ph"><span class="pn">8</span><b>Verdict and where it looked</b></div>'
+        f'<div class="pframe"><img src="{esc(ex["src"])}" alt="" loading="lazy">'
+        f'<img class="pheat" src="{esc(ex["heat"])}" alt="Heatmap over the photo" loading="lazy"></div>'
+        f'<div class="pbars"><span>{esc(pos)}</span><span class="pbar"><span class="pos" style="width:{p_pos:.1f}%">'
+        f'</span></span><b>{p_pos:.0f}%</b><span>{esc(neg)}</span><span class="pbar"><span class="neg" '
+        f'style="width:{100 - p_pos:.1f}%"></span></span><b>{100 - p_pos:.0f}%</b></div>'
+        f'<p>Grad-CAM asks stage 4 which spots pushed the score toward "{esc(pos)}", and stretches that 7×7 '
+        f'answer over the photo. That is why the heat is a soft blob, not an outline.</p></li>')
+    inside = [
+        ("3×3 filters", "the pattern detectors: small grids of learned numbers that slide over the maps"),
+        ("Batch normalization", "rescales the numbers after each filter layer so training stays stable"),
+        ("ReLU", "keeps positive responses (\"pattern here\") and sets the rest to zero"),
+        ("Shortcut", "adds each block's input back to its output, so a block only learns a correction. The "
+                     "\"Res\" in ResNet, and what lets deep networks train well"),
     ]
-    s = []
-    arrow = lambda x1, x2: f'<path class="flow" d="M{x1},{cy} H{x2}" marker-end="url(#arr)"/>'
-    # Input photo
-    s.append(f'<image href="{esc(ex["src"])}" x="16" y="{cy - 62}" width="124" height="124" '
-             f'preserveAspectRatio="xMidYMid slice"/><rect class="frame" x="16" y="{cy - 62}" width="124" height="124"/>')
-    s.append(f'<text x="78" y="{cy + 82}" class="c b">Photo in</text>'
-             f'<text x="78" y="{cy + 98}" class="c m">resized to 224 × 224</text>')
-    s.append(arrow(144, 168))
-    # First convolution
-    s.append(slab(172, cy, 10, 140, 8, "stem"))
-    s.append(f'<text x="182" y="{cy + 98}" class="c m">first filters</text>')
-    s.append(arrow(194, 232))
-    # Four stages
-    prev_end = None
-    for i, (x, w, h, grid, filt, what) in enumerate(stages, 1):
-        if prev_end:
-            s.append(arrow(prev_end, x - 4))
-        s.append(slab(x, cy, w, h, 10, f"st{i}"))
-        mid = x + w / 2 + 5
-        s.append(f'<text x="{mid}" y="{cy - h / 2 - 18}" class="c b">Stage {i}</text>'
-                 f'<text x="{mid}" y="{cy + h / 2 + 22}" class="c">{grid} · {filt}</text>'
-                 + "".join(f'<text x="{mid}" y="{cy + h / 2 + 38 + 15 * k}" class="c m">{line}</text>'
-                           for k, line in enumerate(what.split("|"))))
-        prev_end = x + w + 14
-    # Average pool and final layer
-    s.append(arrow(prev_end, 600))
-    s.append(f'<rect class="pool" x="604" y="{cy - 40}" width="12" height="80"/>'
-             f'<text x="610" y="{cy - 52}" class="c b">Average</text>'
-             f'<text x="610" y="{cy + 58}" class="c">512</text><text x="610" y="{cy + 74}" class="c m">numbers</text>')
-    s.append(arrow(620, 648))
-    s.append(f'<rect class="fc" x="652" y="{cy - 26}" width="40" height="52" rx="6"/>'
-             f'<text x="672" y="{cy + 5}" class="c b inv">512→2</text>'
-             f'<text x="672" y="{cy - 38}" class="c b">Final layer</text>')
-    s.append(arrow(696, 722))
-    # Verdict bars
-    for j, (label, p) in enumerate(((pos, p_pos), (neg, 100 - p_pos))):
-        y = cy - 34 + j * 40
-        s.append(f'<text x="728" y="{y}" class="m">{esc(label)}</text>'
-                 f'<rect class="track" x="728" y="{y + 6}" width="120" height="14" rx="3"/>'
-                 f'<rect class="{"bar-pos" if j == 0 else "bar-neg"}" x="728" y="{y + 6}" '
-                 f'width="{max(1.5, 1.2 * p):.1f}" height="14" rx="3"/>'
-                 f'<text x="856" y="{y + 18}" class="b">{p:.0f}%</text>')
-    s.append(f'<text x="728" y="{cy - 56}" class="b">Verdict</text>')
-    # Grad-CAM branch from stage 4 to the heatmap
-    x4 = stages[-1][0] + stages[-1][2] / 2
-    s.append(f'<path class="cam" d="M{x4},{cy + 62} V{cy + 140} H{972} V{cy + 66}" marker-end="url(#arr2)"/>'
-             f'<text x="{(x4 + 972) / 2}" y="{cy + 134}" class="c cam-t">Grad-CAM: which spots in stage 4 pushed '
-             f'the verdict toward "{esc(pos)}"</text>')
-    s.append(f'<image href="{esc(ex["src"])}" x="910" y="{cy - 62}" width="124" height="124" '
-             f'preserveAspectRatio="xMidYMid slice"/>'
-             f'<image href="{esc(ex["heat"])}" x="910" y="{cy - 62}" width="124" height="124" '
-             f'preserveAspectRatio="xMidYMid slice"/><rect class="frame" x="910" y="{cy - 62}" width="124" height="124"/>'
-             f'<text x="972" y="{cy - 74}" class="c b">Where it looked</text>')
-    # Brackets: what was pre-trained vs new
-    s.append('<path class="brk" d="M172,36 v-8 H572 v8"/>'
-             '<text x="372" y="18" class="c m">Pre-trained on ImageNet (everyday photos), then fine-tuned on our photos</text>'
-             '<path class="brk" d="M652,36 v-8 H692 v8"/><text x="672" y="18" class="c m">New for our task</text>')
-    svg = ('<svg class="netfig" viewBox="0 0 1050 330" role="img" aria-labelledby="nettitle netdesc">'
-           '<title id="nettitle">Our ResNet-18 network, from photo to verdict and heatmap</title>'
-           f'<desc id="netdesc">A held-out {esc(d["ds"]["title"][:-1])} photo enters the network, passes a first set of '
-           'filters and four stages that shrink the image from 56 by 56 to 7 by 7 while growing from 64 to 512 '
-           f'filters, is averaged into 512 numbers, and a final layer outputs {esc(pos)} {p_pos:.0f} percent. '
-           'Grad-CAM reads stage 4 to draw the heatmap of where the model looked.</desc>'
-           '<defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" '
-           'orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="arrowhead"/></marker>'
-           '<marker id="arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" '
-           'orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="camhead"/></marker></defs>'
-           + "".join(s) + '</svg>')
-    return (f'<h3>Inside our network</h3><p class="sub">One real held-out {esc(d["ds"]["title"][:-1])}, start to '
-            'finish. Each stage is a set of learned filters that slide across the image: early stages respond to '
-            'simple things like edges and spots, later ones to larger patterns. The image gets smaller at each stage '
-            'while the number of filters grows. The descriptions under each stage are the typical roles in networks '
-            'like this, not something measured here.</p>'
-            f'<div class="netwrap">{svg}</div>'
-            '<p class="caption">ResNet-18: 18 layers with learned weights (1 first layer, 16 in the four stages, 1 final '
-            'layer), about 11.2 million numbers in all, every one adjusted during training. Inside each stage, '
-            '"shortcut" connections (not drawn) let the signal skip ahead, which is what lets deep networks like this '
-            'train well.</p>')
+    return (
+        f'<h3>Inside our network</h3><p class="sub">One real held-out {esc(thing)}, start to finish. The pictures '
+        f'are real: what our trained network computed for this photo at each stage. A stage produces one '
+        f'<i>feature map</i> per detector (bright = strong response), and four are shown for each. They are drawn '
+        f'at their true resolution, so they get blockier as the network shrinks the image and looks for bigger '
+        f'patterns.</p>'
+        f'<ol class="pipe">{"".join(cards)}</ol>'
+        f'<div class="inside"><b>Inside each stage:</b> two blocks, each with ' + "".join(
+            f'<span class="chip"><b>{esc(a)}</b> {esc(b)}</span>' for a, b in inside) + '</div>'
+        f'<p class="caption">ResNet-18: 18 layers with learned weights, about 11.2 million numbers in all. Training '
+        f'started from weights learned on ImageNet (everyday photos), so the early stages already knew edges and '
+        f'textures; all 11.2 million numbers were then adjusted on our photos, the deepest stages and the new final '
+        f'layer the most. The stage descriptions are the typical roles in networks like this; the pictures are '
+        f'what this one actually did. Stages 1 to 3 show the four maps with the most going on; stage 4 shows the four '
+        f'that added most to the heatmap.</p>')
 
 
 def edge_note(data):
@@ -499,32 +513,50 @@ box-shadow:0 2px 8px rgba(0,0,0,.08)}
 .modelbar .tabs{margin:0}
 .modelbar .tabs button{font-size:15px;padding:8px 16px}
 .modelbar .what{font-size:13px;color:var(--muted);flex-basis:100%}
+@media (max-width:600px){.modelbar .what{display:none}.modelbar .wrap{padding-top:8px;padding-bottom:8px}}
 .compare td small{display:block;font-size:12px;color:var(--muted)}
 .compare td:nth-child(2),.compare td:nth-child(3){font-weight:700}
-.netwrap{overflow-x:auto;-webkit-overflow-scrolling:touch;background:var(--surface);border:1px solid var(--line);
-border-radius:10px;padding:12px 8px}
-.netfig{display:block;width:100%;min-width:760px;height:auto}
-.netfig text{font:13px system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;fill:var(--ink)}
-.netfig .c{text-anchor:middle}.netfig .b{font-weight:700}.netfig .m{fill:var(--muted);font-size:12px}
-.netfig .inv{fill:#fff}
-.netfig .frame{fill:none;stroke:var(--line);stroke-width:1.5}
-.netfig .flow{stroke:var(--muted);stroke-width:2;fill:none}.netfig .arrowhead{fill:var(--muted)}
-.netfig .cam{stroke:#e8590c;stroke-width:2;stroke-dasharray:6 4;fill:none}.netfig .camhead{fill:#e8590c}
-.netfig .cam-t{fill:#c2410c;font-weight:600;font-size:12px}
-.netfig .brk{fill:none;stroke:var(--muted);stroke-width:1.5}
-.netfig .stem,.netfig .st1,.netfig .st2,.netfig .st3,.netfig .st4{stroke:var(--hero);stroke-width:1}
-.netfig .stem{fill:#9db8e8}.netfig .st1{fill:#7fa6ea}.netfig .st2{fill:#5a8de6}.netfig .st3{fill:#3874e0}
-.netfig .st4{fill:#0b5fe0}
-.netfig .top{filter:brightness(1.18)}.netfig .side{filter:brightness(.78)}
-.netfig .pool{fill:var(--neg)}.netfig .fc{fill:var(--hero);stroke:var(--line)}
-.netfig .track{fill:var(--track);stroke:var(--line)}.netfig .bar-pos{fill:var(--bad)}.netfig .bar-neg{fill:var(--neg)}
-@media (prefers-color-scheme:dark){.netfig .cam-t{fill:#ff9f5a}.netfig .fc{fill:#1d3a66}}
+.pipe{list-style:none;margin:8px 0 18px;padding:0;display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px 26px}
+@media (max-width:900px){.pipe{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media (max-width:520px){.pipe{grid-template-columns:1fr}}
+.pcard{position:relative;background:var(--surface);border:1px solid var(--line);border-top:4px solid var(--pos);
+border-radius:10px;padding:12px;font-size:14px}
+.pcard::after{content:"→";position:absolute;right:-21px;top:118px;font-size:20px;font-weight:700;color:var(--muted)}
+.pcard:nth-child(4n)::after,.pcard:last-child::after{content:none}
+@media (max-width:900px){.pcard:nth-child(2n)::after{content:none}.pcard:nth-child(4n+1)::after,.pcard:nth-child(4n+3)::after{content:"→"}}
+@media (max-width:520px){.pcard::after,.pcard:nth-child(4n+1)::after,.pcard:nth-child(4n+3)::after{content:none}}
+.pcard .ph{display:flex;align-items:center;flex-wrap:wrap;gap:4px 8px;margin-bottom:8px}
+.pcard .pn{display:inline-grid;place-items:center;width:24px;height:24px;border-radius:999px;background:var(--ink);
+color:var(--surface);font-size:13px;font-weight:700}
+.pcard .ptag{font-size:11px;font-weight:600;color:var(--muted);border:1px solid var(--line);border-radius:999px;padding:1px 7px}
+.pcard .ptag.new{color:var(--warn);border-color:var(--warn);background:var(--warn-bg)}
+.pcard img{display:block;width:100%;aspect-ratio:1;object-fit:cover;border-radius:6px;background:var(--bg)}
+.pcard img.maps{object-fit:contain;background:transparent;image-rendering:pixelated}
+.pcard img[src$="pooled.png"]{aspect-ratio:2}
+.pcard .pdim{font-size:12px;font-weight:700;margin:8px 0 4px;font-variant-numeric:tabular-nums}
+.pcard p{margin:4px 0;color:var(--ink);line-height:1.45}
+.pcard p.pshow{color:var(--muted);font-size:13px}
+.pframe{position:relative}.pframe .pheat{position:absolute;inset:0;background:transparent}
+.pbars{display:grid;grid-template-columns:auto 1fr auto;align-items:center;gap:4px 8px;font-size:13px;margin:8px 0}
+.pbar{height:12px;background:var(--track);border:1px solid var(--line);border-radius:3px;overflow:hidden}
+.pbar span{display:block;height:100%}.pbar .pos{background:var(--bad)}.pbar .neg{background:var(--neg)}
+.inside{font-size:13px;color:var(--muted);display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:4px 0 6px}
+.inside .chip{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:6px 10px;color:var(--ink);
+flex:1 1 220px}
+.inside .chip b{display:block;font-size:13px}
+.author{display:inline-flex;align-items:center;gap:10px;margin:0 0 18px;padding:5px 14px 5px 5px;border-radius:999px;
+background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.28);color:var(--hero-ink);text-decoration:none;
+font-weight:400;line-height:1.2}
+.author:hover,.author:focus-visible{background:rgba(255,255,255,.18)}
+.author img{width:38px;height:38px;border-radius:999px;border:2px solid rgba(255,255,255,.7);background:#fff}
+.author b{display:block;font-size:15px}.author small{display:block;font-size:12px;color:var(--hero-muted)}
 .badge{display:inline-block;font-size:12px;font-weight:700;padding:2px 8px;border-radius:999px;border:1px solid var(--line);
 background:var(--track);color:var(--ink);vertical-align:middle;margin-left:6px}
 </style>
 </head>
 <body data-model="rek">
 <header><div class="wrap">
+__AUTHOR__
 <h1>__TITLE__</h1>
 <p class="lede">A pass/fail camera check of the kind a robot cell runs: train a custom vision model on labeled
 photos, then measure it on images it has never seen, counting missed defects and false rejects separately.</p>
@@ -799,7 +831,7 @@ def main():
             'After each pass over the training images it was scored on the same test set, and the best pass was '
             'kept. Then it was tested once on the held-out images. Unlike the Rekognition model, every part of it is '
             'visible, which is what makes the heatmaps possible.</p>'
-            + network_diagram(data)
+            + network_cards(data)
             + "".join(f'<h3>{title_of(d)}</h3><div class="grid2"><div>{confusion(d, cnn_summary(d))}</div>'
                       f'<div>{cnn_details(d)}</div></div>' for d in data) + '</div>')
         cnn_method = (f'<li>Our own CNN: ResNet-18 (PyTorch, ImageNet starting weights), fine-tuned {esc(where)} on '
@@ -830,6 +862,7 @@ def main():
 
     page = (PAGE.replace("__REPO__", REPO_URL).replace("__DATE__", date.today().strftime("%B %Y"))
             .replace("__TITLE__", title).replace("__BUILT_WITH__", built_with)
+            .replace("__AUTHOR__", author_badge(github_profile()))
             .replace("__MODELBAR__", modelbar).replace("__COMPARE__", compare_table(data))
             .replace("__KPIS__", kpi_html).replace("__BASELINE__", base_html).replace("__MODEL__", model_html)
             .replace("__CNN_MODEL__", cnn_model).replace("__CNN_METHOD__", cnn_method)
@@ -847,6 +880,10 @@ def main():
             dest = SITE / im["src"]
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(im["file"], dest)  # byte-for-byte: no resizing, cropping or re-encoding
+        if d["cnn"] and d["cnn"]["layers"]:
+            (SITE / "net" / d["name"]).mkdir(parents=True, exist_ok=True)
+            for png in (d["cnn"]["dir"] / "layers").glob("*.png"):
+                shutil.copyfile(png, SITE / "net" / d["name"] / png.name)
         for r in (d["cnn"] or {}).get("rows", []):
             dest = SITE / r["heat"]
             dest.parent.mkdir(parents=True, exist_ok=True)

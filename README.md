@@ -36,8 +36,8 @@ columns simply take the model's top guess for each image.
   CNN tied Rekognition on castings, and its heatmaps land on the damaged rim of defective parts. On shipping cases
   it leaned toward "intact" and missed 20 of 39 damaged cases. Some of those "damaged" photos look undamaged (an
   open carton, a takeout box), so the labels themselves are part of the problem.
-- **Fast enough for a line:** our CNN classifies one image in about 3 ms on a GTX 1070 and 15 to 18 ms on the CPU,
-  with no network round trip.
+- **Fast enough for a line:** our CNN classifies one image in about 3.5 ms on a GTX 1070 and 15 to 18 ms on the
+  CPU, with no network round trip.
 
 The whole project used about $3 to $4 of AWS credits; models are stopped as soon as each test ends.
 
@@ -176,14 +176,18 @@ link. Re-running it publishes the current build to the same link.
 network (PyTorch, starting from ImageNet weights), fine-tuned on the training set, the best pass picked on the test
 set, then scored once on the held-out set. It also draws a Grad-CAM heatmap for every held-out image, showing which
 parts of the photo pushed it toward "defective" or "damaged", and measures how long one image takes to classify.
-The results site gets a **Model** switch (Amazon Rekognition / Our own CNN), a side-by-side table, a diagram of the
-network following one real held-out part from photo to verdict and heatmap, and a heatmap gallery.
+The results site gets a **Model** switch (Amazon Rekognition / Our own CNN), a side-by-side table, a heatmap
+gallery, and an "Inside our network" walk-through: one real held-out part followed through every stage, with the
+actual feature maps the trained network computed at each one (`sagemaker/job/layer_maps.py`, run automatically after
+training), shown at their true resolution from 56×56 down to 7×7.
+
+Training is seeded, so re-running it reproduces the same predictions on the same hardware and software.
 
 Results of the run on a GTX 1070 (8 passes over the images, best pass picked on the test set):
 
 | Dataset | Training time | Best pass (test accuracy) | Held-out accuracy | Time per image: GPU / CPU |
 |---|---|---|---|---|
-| Cast pump impellers | 86 s (includes the first-run weights download) | 2 of 8 (99.5%) | 100% | 3.0 ms / 18.2 ms |
+| Cast pump impellers | 70 s | 2 of 8 (99.5%) | 100% | 3.5 ms / 17.3 ms |
 | Shipping cases | 38 s | 3 of 8 (87.1%) | 76.1% | 3.4 ms / 15.5 ms |
 
 It needs no AWS access and costs nothing. An NVIDIA GPU is used if present (this run used a GTX 1070); without one

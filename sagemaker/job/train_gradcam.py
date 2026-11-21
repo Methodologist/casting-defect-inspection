@@ -11,6 +11,7 @@ Outputs (/opt/ml/output/data, uploaded by SageMaker as output.tar.gz):
   <dataset>/predictions.json      verdict, confidence and heatmap file for every held-out image
   <dataset>/heatmaps/<image>.png  transparent overlay, same size as the original image (the original is untouched)
   <dataset>/metrics.json          held-out accuracy, confusion matrix, training history, hardware and speed
+  <dataset>/model.pt              the trained weights (used by layer_maps.py for the site's network diagram)
 
 Heatmaps show Grad-CAM evidence for the positive class (defective / damaged), scaled on one shared scale per
 dataset, so a good part should look mostly clear instead of every image glowing somewhere.
@@ -228,6 +229,7 @@ def run_dataset(name, args, out_root):
                "precision": round(cm["tp"] / max(cm["tp"] + cm["fp"], 1), 4), "history": history}
     (out / "predictions.json").write_text(json.dumps(preds, indent=1))
     (out / "metrics.json").write_text(json.dumps(metrics, indent=1))
+    torch.save({k: v.cpu() for k, v in model.state_dict().items()}, out / "model.pt")  # for layer_maps.py
     print(f"[{name}] held-out accuracy {metrics['heldout_accuracy']:.3f} "
           f"(tp {cm['tp']} fn {cm['fn']} fp {cm['fp']} tn {cm['tn']})", flush=True)
 

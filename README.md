@@ -11,27 +11,43 @@ check a camera does in a robot cell.
 Data: the "casting product image data for quality inspection" dataset on Kaggle (top-view photos of
 submersible pump impellers, sorted into `def_front` and `ok_front`).
 
-## One-time setup (about 30 minutes)
+## One-time setup (about 20 minutes)
 
-**1. Set a budget alert first.** In the AWS console, go to Billing > Budgets > Create budget. Choose a
-monthly cost budget of $20 with an email alert.
+You need the [AWS CLI v2](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html)
+and Python 3.10 or newer. No access keys are created or stored anywhere in this project.
 
-**2. Make an IAM user for this project.** Don't use the root account's keys.
-- IAM > Users > Create user, named `vision-project`. It doesn't need console access.
-- Attach two policies: `AmazonRekognitionCustomLabelsFullAccess` and `AmazonRekognitionReadOnlyAccess`.
-- Open the user > Security credentials > Create access key > "Local code".
-- Copy `.aws/credentials.example` to `.aws/credentials` and paste the key ID and secret into it. That
-  file is git-ignored. Never paste the secret anywhere else.
+**1. Sign in with the AWS CLI.** This opens a browser. The credentials last 12 hours and renew for up
+to 90 days without signing in again.
 
-**3. Make the S3 bucket.** S3 > Create bucket, region **US East (N. Virginia) us-east-1**, with the
-default settings (public access stays blocked). The name must contain `custom-labels`, for example
-`custom-labels-casting-demo`, because the Custom Labels policy only covers buckets named that way.
-Copy `settings.example.json` to `settings.json` and put the bucket name in it.
+```powershell
+aws configure set region us-east-2 --profile vision-inspection
+aws login --region us-east-2 --profile vision-inspection
+```
+
+Use the Region your AWS account works in. Rekognition Custom Labels is only offered in some Regions;
+this project was built in us-east-2 (Ohio). If you use the new AWS experience, your project's Region
+is under AWS Settings > your project > Overview > Additional info.
+
+**2. Watch the spend.** On the Free plan the account pauses when credits run out instead of billing
+you, so keep an eye on remaining credits in AWS Settings > Billing. On a paid account, set a $20
+monthly budget alert under Billing and Cost Management > Budgets.
+
+**3. Make the S3 bucket** in the same Region, with the default settings (public access stays
+blocked). The name must contain `custom-labels`, for example `custom-labels-casting-demo`. That
+matches the `AmazonRekognitionCustomLabelsFullAccess` policy, in case you run this as an IAM user.
+
+```powershell
+aws s3 mb s3://custom-labels-casting-demo --region us-east-2 --profile vision-inspection
+```
+
+Copy `settings.example.json` to `settings.json` and put your bucket name, Region and profile in it.
+`settings.json` is git-ignored.
 
 **4. Get the images.** Download the dataset zip from Kaggle and extract it into `data/` here, so you
 end up with `data/casting_data/casting_data/train/def_front` and so on. The exact depth doesn't matter.
 
-**5. Install boto3** (the AWS SDK for Python), from this folder in PowerShell:
+**5. Install boto3** (the AWS SDK for Python), from this folder in PowerShell. The `[crt]` extra is
+what lets boto3 use `aws login` credentials.
 
 ```powershell
 python -m venv .venv
@@ -44,7 +60,7 @@ Run everything from this folder with `.venv\Scripts\python`.
 
 | Command | What it does | Time | Cost |
 |---|---|---|---|
-| `check_setup.py` | Checks the key, bucket, Rekognition access and dataset. Spends nothing. | 1 min | $0 |
+| `check_setup.py` | Checks the sign-in, bucket, Rekognition access and dataset. Spends nothing. | 1 min | $0 |
 | `step1_baseline.py` | DetectLabels on 50 images, tallies what it sees for good vs defective | 2 min | free tier, else about 5 cents |
 | `step2_train.py` | Uploads 1,200 images, builds the datasets, trains, prints precision/recall/F1 | about 1 to 2 hours, mostly waiting | about $1 to $3 |
 | `step3_test.py` | Starts the model, tests 100 unseen images, **stops it**, prints the confusion matrix | 20 to 40 min | about $2 to $4 |
@@ -65,7 +81,6 @@ A stopped model costs nothing to keep, so you can start it again for a live demo
 When you're done with the project for good:
 - Delete the project in the Rekognition console (Custom Labels > Projects).
 - Empty and delete the bucket in S3.
-- Deactivate the IAM user's access key.
 
 ## Why Ground Truth isn't used
 

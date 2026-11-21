@@ -140,7 +140,7 @@ def baseline_table(d):
                            f'<span class="val">{pct(r[l])}</span></div></td>'
                            for l, cls in ((neg, "neg"), (pos, "pos")))
                  + "</tr>")
-    return (f'<table class="baseline"><thead>{head}</thead><tbody>{body}</tbody></table>'
+    return (f'<div class="tablewrap"><table class="baseline"><thead>{head}</thead><tbody>{body}</tbody></table></div>'
             f'<p class="caption">Share of {b["n"]} held-out images on which off-the-shelf DetectLabels returned each '
             f'label. Highlighted rows differ by 25 points or more between classes.</p>'
             f'<p>{esc(BASELINE_NOTES.get(d["name"], ""))}</p>')
@@ -151,12 +151,12 @@ def confusion(d):
     if not h:
         return ""
     s, pos, neg = h["summary"], ds["positive"], ds["negative"]
-    return (f'<table class="confusion"><thead><tr><th></th><th>Predicted {esc(pos)}</th>'
+    return (f'<div class="tablewrap"><table class="confusion"><thead><tr><th></th><th>Predicted {esc(pos)}</th>'
             f'<th>Predicted {esc(neg)}</th></tr></thead><tbody>'
             f'<tr><th>Actually {esc(pos)}</th><td class="good">{s["true_positive"]}<small>caught</small></td>'
             f'<td class="bad">{s["false_negative"]}<small>missed</small></td></tr>'
             f'<tr><th>Actually {esc(neg)}</th><td class="warn">{s["false_positive"]}<small>false reject</small></td>'
-            f'<td class="good">{s["true_negative"]}<small>passed</small></td></tr></tbody></table>')
+            f'<td class="good">{s["true_negative"]}<small>passed</small></td></tr></tbody></table></div>')
 
 
 def eval_table(d):
@@ -165,8 +165,8 @@ def eval_table(d):
         return '<p class="pending">Training not finished yet.</p>'
     rows = "".join(f'<tr><td>{esc(r["label"])}</td><td>{esc(r["images"])}</td><td>{pct(r["precision"], 1)}</td>'
                    f'<td>{pct(r["recall"], 1)}</td><td>{pct(r["f1score"], 1)}</td></tr>' for r in e["labels"])
-    return (f'<table class="eval"><thead><tr><th>Label</th><th>Test images</th><th>Precision</th><th>Recall</th>'
-            f'<th>F1</th></tr></thead><tbody>{rows}</tbody></table>'
+    return (f'<div class="tablewrap"><table class="eval"><thead><tr><th>Label</th><th>Test images</th><th>Precision</th><th>Recall</th>'
+            f'<th>F1</th></tr></thead><tbody>{rows}</tbody></table></div>'
             f'<p class="caption">AWS\'s own evaluation after training, on the {esc(e["images"])}-image test set '
             f'(overall F1 {pct(e["f1"], 1)}). The held-out numbers above come from separate images the model never '
             f'saw during training or evaluation.</p>')
@@ -250,6 +250,24 @@ tr.lean td{background:var(--lean)}
 .card.ok{border-top:4px solid var(--good)}.card.ok .verdict{color:var(--good)}
 .card.miss{border:2px solid var(--bad);border-top-width:4px}.card.miss .verdict{color:var(--bad)}
 .card .truth{color:var(--muted)}
+.card .open{display:block;width:100%;padding:0;border:0;background:none;cursor:zoom-in}
+.card .open:focus-visible{outline:3px solid var(--pos);outline-offset:-3px}
+dialog.viewer{position:fixed;inset:0;margin:0;border:0;padding:0;background:transparent;max-width:none;max-height:none;
+width:100%;height:100%;color:#fff;overflow:hidden}
+dialog.viewer::backdrop{background:rgba(5,8,12,.94)}
+.tablewrap{overflow-x:auto;-webkit-overflow-scrolling:touch;border-radius:10px}
+@media (max-width:600px){.bar{min-width:84px}th,td{padding:7px 8px}.kpi-value{font-size:28px}}
+.viewer .stage{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;padding:56px 64px}
+.viewer img{width:min(82vw,78vh);height:min(82vw,78vh);object-fit:contain;background:#000;border-radius:8px;image-rendering:auto}
+.viewer .vcap{font-size:16px;text-align:center}
+.viewer .vcap b{font-size:18px}
+.viewer .vcap .vok{color:#6be39c}.viewer .vcap .vmiss{color:#ff8f80}
+.viewer .vmeta{color:#c3cbd6;font-size:13px}
+.viewer button{position:absolute;font:inherit;font-size:26px;line-height:1;color:#fff;background:rgba(255,255,255,.12);
+border:1px solid rgba(255,255,255,.35);border-radius:999px;width:48px;height:48px;cursor:pointer}
+.viewer button:hover,.viewer button:focus-visible{background:rgba(255,255,255,.28)}
+.viewer .vclose{top:14px;right:14px}.viewer .vprev{left:12px;top:50%}.viewer .vnext{right:12px;top:50%}
+@media (max-width:600px){.viewer .stage{padding:64px 12px}.viewer .vprev,.viewer .vnext{top:auto;bottom:14px}}
 .flow{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:8px 0 20px}
 .step{background:var(--surface);border:1px solid var(--line);border-top:4px solid var(--pos);border-radius:10px;padding:14px;position:relative}
 .step b{display:block;margin-bottom:4px}
@@ -337,6 +355,16 @@ __CREDITS__
 <footer><div class="wrap">Built with Amazon Rekognition Custom Labels and Amazon S3, hosted on Amazon CloudFront.
 Images remain the property of their creators and are used under the licenses listed above.</div></footer>
 
+<dialog class="viewer" id="viewer" aria-label="Enlarged image">
+<div class="stage" id="vstage">
+<img id="vimg" alt="">
+<div class="vcap" id="vcap"></div>
+</div>
+<button class="vclose" id="vclose" aria-label="Close">✕</button>
+<button class="vprev" id="vprev" aria-label="Previous image">‹</button>
+<button class="vnext" id="vnext" aria-label="Next image">›</button>
+</dialog>
+
 <script>
 const ITEMS = __ITEMS__;
 const NAMES = __NAMES__;
@@ -355,18 +383,53 @@ function render() {
   const all = ITEMS.filter(i => i.d === state.d);
   count.textContent = all.length ? `${shown.length} of ${all.length} images · ${all.filter(i => !i.ok).length} wrong calls`
                                  : "Held-out test not run yet.";
-  grid.replaceChildren(...shown.map(i => {
+  current = shown;
+  grid.replaceChildren(...shown.map((i, n) => {
     const c = document.createElement("figure"); c.className = "card " + (i.ok ? "ok" : "miss"); c.style.margin = 0;
     const img = document.createElement("img"); img.src = i.src; img.loading = "lazy";
     img.alt = `Held-out image, actually ${i.t}`;
+    const open = document.createElement("button"); open.className = "open"; open.type = "button";
+    open.setAttribute("aria-label", `Enlarge image ${n + 1}: actually ${i.t}, predicted ${i.p}`);
+    open.onclick = () => show(n, open); open.append(img);
     const info = document.createElement("figcaption"); info.className = "info";
     const v = document.createElement("div"); v.className = "verdict";
     v.textContent = (i.ok ? "✓ " : "✗ ") + `Predicted ${i.p}` + (i.c ? ` · ${Math.round(+i.c)}%` : "");
     const t = document.createElement("div"); t.className = "truth"; t.textContent = `Actually ${i.t}`;
-    info.append(v, t); c.append(img, info); return c;
+    info.append(v, t); c.append(open, info); return c;
   }));
 }
+
+// Enlarged view: click an image; arrows or ←/→ to move, Esc / ✕ / click outside to close.
+const viewer = document.getElementById("viewer"), vimg = document.getElementById("vimg"),
+      vcap = document.getElementById("vcap");
+let current = [], at = 0, opener = null;
+function paint() {
+  const i = current[at];
+  vimg.src = i.src; vimg.alt = `Held-out image ${at + 1} of ${current.length}, actually ${i.t}`;
+  vcap.replaceChildren();
+  const b = document.createElement("b"); b.className = i.ok ? "vok" : "vmiss";
+  b.textContent = (i.ok ? "✓ Correct: " : "✗ Wrong: ") + `predicted ${i.p}` + (i.c ? ` · ${Math.round(+i.c)}% confident` : "");
+  const t = document.createElement("div"); t.textContent = `Actually ${i.t}`;
+  const m = document.createElement("div"); m.className = "vmeta";
+  m.textContent = `Image ${at + 1} of ${current.length} · original resolution, shown enlarged`;
+  vcap.append(b, t, m);
+}
+function show(n, from) {
+  at = n; opener = from || null; paint();
+  if (!viewer.open) viewer.showModal();
+}
+function step(d) { if (current.length) { at = (at + d + current.length) % current.length; paint(); } }
+document.getElementById("vclose").onclick = () => viewer.close();
+document.getElementById("vprev").onclick = () => step(-1);
+document.getElementById("vnext").onclick = () => step(1);
+viewer.addEventListener("click", e => { if (e.target === viewer || e.target.id === "vstage") viewer.close(); });
+viewer.addEventListener("keydown", e => {
+  if (e.key === "ArrowLeft") { step(-1); e.preventDefault(); }
+  if (e.key === "ArrowRight") { step(1); e.preventDefault(); }
+});
+viewer.addEventListener("close", () => { if (opener) opener.focus(); });
 render();
+if (location.hash === "#preview-viewer" && current.length) show(0);
 </script>
 </body>
 </html>

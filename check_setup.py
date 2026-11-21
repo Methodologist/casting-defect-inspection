@@ -4,12 +4,12 @@ from common import LABELS, client, find_images, run, settings, splits
 
 def main():
     s = settings()
-    print(f"Region {s['region']}, bucket {s['bucket']}, project {s['project']}")
+    print(f"Region {s['region']}, profile {s['profile'] or 'default'}, bucket {s['bucket']}, project {s['project']}")
 
     who = client("sts").get_caller_identity()
-    print(f"OK  AWS key works (account {who['Account']})")
+    print("OK  AWS sign-in works")
     if who["Arn"].endswith(":root"):
-        print("    WARNING: this is the root user's key. Make an IAM user for this project instead (see README).")
+        print("    WARNING: these are the root user's access keys. Use `aws login` instead (see README).")
 
     s3 = client("s3")
     where = s3.get_bucket_location(Bucket=s["bucket"]).get("LocationConstraint") or "us-east-1"

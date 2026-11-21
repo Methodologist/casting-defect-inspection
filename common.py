@@ -13,13 +13,12 @@ DATA = Path(os.environ.get("VISION_DATA", ROOT / "data"))
 RESULTS = ROOT / "results"
 RESULTS.mkdir(exist_ok=True)
 
-# AWS credentials and config live inside this project folder (git-ignored), not in the user profile on C:.
-os.environ.setdefault("AWS_SHARED_CREDENTIALS_FILE", str(ROOT / ".aws" / "credentials"))
-os.environ.setdefault("AWS_CONFIG_FILE", str(ROOT / ".aws" / "config"))
+# Credentials come from the AWS CLI profile named in settings.json (created with `aws login --profile ...`).
+# Nothing secret is stored in this folder.
 
 try:
     import boto3
-    from botocore.exceptions import ClientError, NoCredentialsError
+    from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError
 except ImportError:
     sys.exit("boto3 is not installed. Run: .venv\\Scripts\\pip install -r requirements.txt")
 
@@ -44,7 +43,8 @@ def settings():
     if not path.exists():
         sys.exit("settings.json is missing. Copy settings.example.json to settings.json and put your bucket name in it.")
     s = json.loads(path.read_text())
-    s.setdefault("region", "us-east-1")
+    s.setdefault("region", "us-east-2")
+    s.setdefault("profile", None)
     s.setdefault("project", "casting-inspection")
     s.setdefault("version", "v1")
     bucket = s.get("bucket", "")
@@ -56,8 +56,16 @@ def settings():
     return s
 
 
+_session = None
+
+
 def client(name):
-    return boto3.client(name, region_name=settings()["region"])
+    """An AWS client using the profile and region from settings.json."""
+    global _session
+    if _session is None:
+        s = settings()
+        _session = boto3.Session(profile_name=s["profile"], region_name=s["region"])
+    return _session.client(name)
 
 
 def find_images():
@@ -165,10 +173,13 @@ def explain(e):
     code, msg = err.get("Code", ""), err.get("Message", "")
     hint = ""
     if "AccessDenied" in code or code == "UnauthorizedOperation":
-        hint = ("\nThe IAM user is missing a permission. It needs AmazonRekognitionCustomLabelsFullAccess and "
-                "AmazonRekognitionReadOnlyAccess, and the bucket name must contain 'custom-labels'.")
-    elif code in ("InvalidClientTokenId", "SignatureDoesNotMatch", "UnrecognizedClientException", "InvalidAccessKeyId"):
-        hint = "\nThe access key in .aws/credentials is wrong or deactivated."
+        hint = ("\nYour AWS identity is missing a permission. If this worked before, check whether the account hit a "
+                "spend limit or ran out of Free plan credits. If you use an IAM user, it needs "
+                "AmazonRekognitionCustomLabelsFullAccess and AmazonRekognitionReadOnlyAccess, and the bucket name "
+                "must contain 'custom-labels'.")
+    elif code in ("ExpiredToken", "ExpiredTokenException", "InvalidClientTokenId", "SignatureDoesNotMatch",
+                  "UnrecognizedClientException", "InvalidAccessKeyId"):
+        hint = f"\nYour AWS sign-in has expired or is invalid. Run: aws login --profile {settings()['profile'] or 'default'}"
     elif code == "NoSuchBucket":
         hint = "\nCheck the bucket name in settings.json and that it exists in the same region."
     return f"AWS error {code}: {msg}{hint}"
@@ -178,8 +189,11 @@ def run(main):
     try:
         main()
     except NoCredentialsError:
-        sys.exit("No AWS credentials found. Create .aws/credentials from .aws/credentials.example (see README).")
+        sys.exit(f"No AWS credentials found. Run: aws login --profile {settings()['profile'] or 'default'} (see README).")
     except ClientError as e:
         sys.exit(explain(e))
+    except BotoCoreError as e:
+        sys.exit(f"AWS error: {e}\nIf this is about credentials or a login session, run: "
+                 f"aws login --profile {settings()['profile'] or 'default'}")
     except KeyboardInterrupt:
         sys.exit("\nStopped.")

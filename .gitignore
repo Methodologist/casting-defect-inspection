@@ -1,5 +1,4 @@
-.aws/credentials
-.aws/config
+.aws/
 settings.json
 data/
 results/

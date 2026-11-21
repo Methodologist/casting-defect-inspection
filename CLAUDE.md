@@ -75,3 +75,7 @@ Constraints for each level:
 - MUST still execute the user's choice if they disagree with a suggestion
 
 <!-- END AWS Agent Toolkit rules -->
+
+## Project preferences
+
+- help_level: HIGH (chosen 2026-11-20). Explain each step before running it, suggest better alternatives, and flag best practices and trade-offs.

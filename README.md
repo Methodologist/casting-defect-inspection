@@ -104,8 +104,11 @@ When you're done with the project for good:
 
 - **Casting:** "casting product image data for quality inspection" on Kaggle,
   [ravirajsinh45/real-life-industrial-dataset-of-casting-product](https://www.kaggle.com/datasets/ravirajsinh45/real-life-industrial-dataset-of-casting-product).
-  Top-view photos of submersible pump impellers, sorted into `def_front` and `ok_front`. See the Kaggle
-  page for its license terms.
+  By Ravirajsinh Dabhi, licensed
+  [CC BY-NC-ND 4.0](https://creativecommons.org/licenses/by-nc-nd/4.0/) (attribution, non-commercial, no
+  derivatives). Top-view photos of submersible pump impellers, sorted into `def_front` and `ok_front`.
+  Because of the non-commercial term, this project is a demonstration only: a production system would be
+  trained on the customer's own parts.
 - **Packages:** "Damaged vs good packages", provided by a Roboflow user on Roboflow Universe,
   [aadhavs-first-workspace/damaged-vs-good-packages](https://universe.roboflow.com/aadhavs-first-workspace/damaged-vs-good-packages),
   licensed [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). 581 images, resized to 224×224 by

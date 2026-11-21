@@ -1,9 +1,12 @@
 # Casting defect inspection with Amazon Rekognition
 
 > **Showcase project.** A portfolio demonstration of camera-based pass/fail inspection on AWS, built on public
-> datasets. It is not a production system and is not maintained as a library. For a two-page summary of what
-> was built, the results and the lessons, see the
-> **[project overview (PDF)](docs/project-overview.pdf)**.
+> datasets. It is not a production system and is not maintained as a library.
+>
+> - **[Interactive results](https://main.d1vk1voghz7z5z.amplifyapp.com/)**: every held-out image with the
+>   model's verdict; click any image to inspect it.
+> - **[Project overview (PDF)](docs/project-overview.pdf)**: a two-page summary of what was built, the
+>   results and the lessons.
 
 ## Results at a glance
 
@@ -106,7 +109,7 @@ folder, so the two runs never overwrite each other. Do the full run on `casting`
 | `check_setup.py` | Checks the sign-in, bucket, Rekognition access and dataset split. Spends nothing. | 1 min | $0 |
 | `step1_baseline.py` | DetectLabels on 50 held-out images, tallies what it sees for each class | 2 min | free tier, else about 5 cents |
 | `step2_train.py` | Uploads the train and test images, builds the datasets, trains, prints precision/recall/F1 | about 1 to 2 hours, mostly waiting | about $1 to $3 |
-| `step3_test.py` | Starts the model, tests the held-out images, **stops it**, prints the confusion matrix | 20 to 40 min | about $2 to $4 |
+| `step3_test.py` | Starts the model, tests the held-out images, **stops it**, prints the confusion matrix | 10 to 40 min | about $0.50 to $4, depending on how long the model takes to start (about $0.50 here) |
 | `stop_model.py` | Shows every project's models and stops anything running, whichever dataset is selected | 1 to 5 min | $0 |
 
 You can close the window during `step2_train.py`. Running it again picks up where it left off.
@@ -119,12 +122,49 @@ Results land in `results/<dataset>/` (git-ignored). For a presentation, screensh
 page in the Rekognition console (Custom Labels > Projects > `casting-inspection` or `packages-inspection` >
 the model). The console opens in one Region at a time; make sure it is the one in `settings.json`.
 
+## The results site
+
+`build_site.py` turns `results/` into a static page in `site/` (git-ignored): held-out results, the
+off-the-shelf baseline, confusion matrices, and a gallery of every held-out image that opens full size on click.
+Only numbers and labels are copied out of the AWS result files, and the build refuses to run if the page would
+contain an account ID, ARN, S3 path, the bucket name, or any term listed under `"private_terms"` in
+`settings.json`. Images are copied byte for byte, never edited.
+
+`deploy_site.py` publishes `site/` with AWS Amplify Hosting (HTTPS, free tier at this size) and prints the
+link. Re-running it publishes the current build to the same link.
+
+```powershell
+.venv\Scripts\python build_site.py
+.venv\Scripts\python deploy_site.py
+```
+
+## Phase 2: where the model looks (SageMaker, in progress)
+
+`sagemaker/` holds a second experiment: fine-tune a ResNet-18 on the same training images in an Amazon
+SageMaker AI training job, test it on the same held-out images, and draw a Grad-CAM heatmap for each one,
+showing which parts of the photo pushed the model toward "defective" or "damaged". The results site adds a
+heatmap library (heat drawn as a separate, switchable layer over the unmodified photo) once real results exist.
+
+```powershell
+.venv\Scripts\pip install -r sagemaker\requirements-launch.txt
+.venv\Scripts\python sagemaker\launch.py role       # least-privilege execution role (one bucket, three prefixes)
+.venv\Scripts\python sagemaker\launch.py upload     # held-out images to s3://<bucket>/heldout/
+.venv\Scripts\python sagemaker\launch.py preflight  # quota, role, pinned container, bucket Region (free)
+.venv\Scripts\python sagemaker\launch.py start      # one ml.m5.xlarge job, capped at 1 hour
+.venv\Scripts\python sagemaker\launch.py fetch      # waits, then saves results to results/<dataset>/sagemaker/
+```
+
+New AWS accounts start with a SageMaker training quota of 0; request "ml.m5.xlarge for training job usage" = 1
+in Service Quotas first. Status: the code is written and checked locally; the cloud run is waiting on that quota.
+
 ## Cleaning up
 
 A stopped model costs nothing to keep, so you can start it again for a live demo with `step3_test.py`.
 When you're done with the project for good:
 - Delete both projects in the Rekognition console (Custom Labels > Projects).
 - Empty and delete the bucket in S3.
+- Delete the Amplify app `inspection-results` (this takes the results site offline).
+- Delete the IAM role `vision-inspection-sagemaker-training`, if you ran phase 2.
 
 ## Data and credits
 
@@ -142,7 +182,8 @@ When you're done with the project for good:
 
 No images are stored in this repository. Download them from the links above.
 
-## Why Ground Truth isn't used
+## Why no labeling tool is used
 
-SageMaker Ground Truth is closed to new AWS customers. The labels here come from the dataset's folder
-names and are written in Ground Truth's manifest format, which Custom Labels reads directly.
+Both datasets arrive already sorted into one folder per class, so no labeling job (for example SageMaker
+Ground Truth) is needed. The labels come from those folder names and are written in Ground Truth's manifest
+format, which Custom Labels reads directly.

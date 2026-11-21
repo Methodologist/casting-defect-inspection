@@ -1,10 +1,12 @@
 """Step 0: checks the AWS key, the bucket, Rekognition access and the dataset before anything costs money."""
-from common import LABELS, client, find_images, run, settings, splits
+from common import client, dataset, run, settings, splits
 
 
 def main():
     s = settings()
-    print(f"Region {s['region']}, profile {s['profile'] or 'default'}, bucket {s['bucket']}, project {s['project']}")
+    ds = dataset()
+    print(f"Dataset {ds['name']} ({ds['title']}), region {s['region']}, profile {s['profile'] or 'default'}, "
+          f"bucket {s['bucket']}, project {s['project']}")
 
     who = client("sts").get_caller_identity()
     print("OK  AWS sign-in works")
@@ -21,11 +23,10 @@ def main():
     client("rekognition").describe_projects(MaxResults=1)
     print("OK  Rekognition Custom Labels is reachable")
 
-    images = find_images()
-    for split in ("train", "test"):
-        print(f"OK  dataset {split}: " + ", ".join(f"{len(images[(split, l)])} {l}" for l in LABELS))
     sp = splits()
-    print(f"    Will use {len(sp['train'])} training, {len(sp['test'])} test and {len(sp['holdout'])} holdout images.")
+    for split in ("train", "test", "holdout"):
+        counts = ", ".join(f"{sum(1 for _, l in sp[split] if l == label)} {label}" for label in ds["labels"])
+        print(f"OK  {split:<8} {len(sp[split]):>4} images ({counts})")
     print("\nAll set. Next: python step1_baseline.py")
 
 

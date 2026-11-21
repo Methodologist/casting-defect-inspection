@@ -1,5 +1,6 @@
-"""Shared setup for the casting inspection scripts: settings, AWS clients, the dataset and its fixed splits."""
+"""Shared setup for the inspection scripts: settings, AWS clients, the datasets and their fixed splits."""
 import csv
+import hashlib
 import json
 import os
 import random
@@ -10,8 +11,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 DATA = Path(os.environ.get("VISION_DATA", ROOT / "data"))
-RESULTS = ROOT / "results"
-RESULTS.mkdir(exist_ok=True)
 
 # Credentials come from the AWS CLI profile named in settings.json (created with `aws login --profile ...`).
 # Nothing secret is stored in this folder.
@@ -22,17 +21,37 @@ try:
 except ImportError:
     sys.exit("boto3 is not installed. Run: .venv\\Scripts\\pip install -r requirements.txt")
 
-# The Kaggle casting dataset sorts images into def_front (defective) and ok_front folders.
-FOLDERS = {"def_front": "defective", "ok_front": "ok"}
-LABELS = ("defective", "ok")
-POSITIVE = "defective"
 EXTENSIONS = {".jpeg": "image/jpeg", ".jpg": "image/jpeg", ".png": "image/png"}
-
-TRAIN_PER_CLASS = 500     # Custom Labels training images per class, from the dataset's train folder
-TEST_PER_CLASS = 100      # Custom Labels test images per class, from the dataset's test folder
-HOLDOUT_PER_CLASS = 50    # images the model never sees, used in step 3
-BASELINE_PER_CLASS = 25   # step 1 uses the first 25 holdout images per class
 SEED = 42
+
+# Each dataset lives in data/<folder>/. "classes" maps the dataset's folder names to the labels used here;
+# the first label is the positive class (the one a line must not miss).
+#   split "given":  the dataset's own train/ and test/ folders are kept apart, with fixed counts per class.
+#   split "pooled": every image of a class is pooled, then shuffled once (seeded) into train/test/holdout.
+DATASETS = {
+    "casting": {
+        "folder": "casting",
+        "title": "cast pump impellers",
+        "classes": {"def_front": "defective", "ok_front": "ok"},
+        "positive_plural": "defective parts",
+        "negative_plural": "good parts",
+        "split": "given",
+        "train_per_class": 500,   # from the dataset's train folder
+        "test_per_class": 100,    # from the dataset's test folder
+        "holdout_per_class": 50,  # also from the test folder, never shown to Custom Labels
+        "baseline_per_class": 25,
+    },
+    "packages": {
+        "folder": "packages",
+        "title": "shipping cases",
+        "classes": {"damaged": "damaged", "intact": "intact"},
+        "positive_plural": "damaged cases",
+        "negative_plural": "intact cases",
+        "split": "pooled",
+        "fractions": {"train": 0.65, "test": 0.20},  # the rest is holdout
+        "baseline_per_class": 25,
+    },
+}
 
 TRAINING_PER_HOUR = 1.00
 INFERENCE_PER_HOUR = 4.00
@@ -43,9 +62,12 @@ def settings():
     if not path.exists():
         sys.exit("settings.json is missing. Copy settings.example.json to settings.json and put your bucket name in it.")
     s = json.loads(path.read_text())
+    s.setdefault("dataset", "casting")
+    if s["dataset"] not in DATASETS:
+        sys.exit(f"settings.json has dataset '{s['dataset']}'. Use one of: {', '.join(DATASETS)}.")
     s.setdefault("region", "us-east-2")
     s.setdefault("profile", None)
-    s.setdefault("project", "casting-inspection")
+    s.setdefault("project", f"{s['dataset']}-inspection")
     s.setdefault("version", "v1")
     bucket = s.get("bucket", "")
     if not bucket or "YOUR" in bucket:
@@ -54,6 +76,21 @@ def settings():
         sys.exit("The bucket name must contain 'custom-labels' so the AmazonRekognitionCustomLabelsFullAccess "
                  "policy covers it (for example custom-labels-casting-demo).")
     return s
+
+
+def dataset():
+    """The dataset chosen in settings.json, with its name and labels filled in."""
+    name = settings()["dataset"]
+    ds = dict(DATASETS[name], name=name)
+    ds["labels"] = tuple(dict.fromkeys(ds["classes"].values()))
+    ds["positive"], ds["negative"] = ds["labels"]
+    return ds
+
+
+def results_dir():
+    path = ROOT / "results" / settings()["dataset"]
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 _session = None
@@ -68,47 +105,84 @@ def client(name):
     return _session.client(name)
 
 
-def find_images():
-    """Returns {(split, label): [paths]} for the train and test folders, sorted by filename."""
-    if not DATA.exists():
-        sys.exit(f"No data folder at {DATA}. Download the Kaggle casting dataset and extract it there (see README).")
+def find_images(ds):
+    """Returns {(split, label): [paths]} from the dataset's train/valid/test folders, sorted by filename."""
+    root = DATA / ds["folder"]
+    if not root.exists():
+        sys.exit(f"No data folder at {root}. Download the {ds['name']} dataset and extract it there (see README).")
     found = {}
-    for folder in DATA.rglob("*"):
-        if not folder.is_dir() or folder.name not in FOLDERS:
+    for folder in root.rglob("*"):
+        if not folder.is_dir() or folder.name not in ds["classes"]:
             continue
         split = folder.parent.name.lower()
-        if split not in ("train", "test"):
-            continue  # the dataset also ships an unsplit casting_512x512 copy; skip it
-        by_name = found.setdefault((split, FOLDERS[folder.name]), {})
+        if split not in ("train", "valid", "test"):
+            continue  # e.g. the casting dataset also ships an unsplit casting_512x512 copy; skip it
+        by_name = found.setdefault((split, ds["classes"][folder.name]), {})
         for f in folder.iterdir():
             if f.suffix.lower() in EXTENSIONS:
                 by_name.setdefault(f.name, f)
-    for split in ("train", "test"):
-        for label in LABELS:
-            if not found.get((split, label)):
-                sys.exit(f"No {split} images for '{label}' under {DATA}. Expected folders like "
-                         f"casting_data/{split}/def_front and casting_data/{split}/ok_front.")
+    for label in ds["labels"]:
+        if not any(found.get((split, label)) for split in ("train", "valid", "test")):
+            sys.exit(f"No images for '{label}' under {root}. Expected folders named "
+                     f"{', '.join(ds['classes'])} inside train/valid/test folders.")
     return {key: [by_name[n] for n in sorted(by_name)] for key, by_name in found.items()}
 
 
+def _digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _unique(paths, exclude=()):
+    """Drops exact duplicate images (same bytes, any filename), keeping the first, and any whose bytes are in exclude."""
+    seen, out = set(exclude), []
+    for p in paths:
+        d = _digest(p)
+        if d not in seen:
+            seen.add(d)
+            out.append(p)
+    return out
+
+
 def splits():
-    """The same images every run: train and test go to Custom Labels, holdout is never shown to it."""
-    images = find_images()
+    """The same images every run: train and test go to Custom Labels, holdout is never shown to it.
+
+    No image in test or holdout is a byte-for-byte copy of a training image. The casting dataset ships a few
+    such copies across its own train and test folders; they are dropped from test and holdout.
+    """
+    ds = dataset()
+    images = find_images(ds)
     out = {"train": [], "test": [], "holdout": [], "baseline": []}
-    for label in LABELS:
+    if ds["split"] == "given":
+        # Only a train image with the same file size as some test image can be a copy of it, so hash just those.
+        test_sizes = {p.stat().st_size for l in ds["labels"] for p in images.get(("test", l), [])}
+        every_train_image = {_digest(p) for l in ds["labels"] for p in images.get(("train", l), [])
+                             if p.stat().st_size in test_sizes}
+    for label in ds["labels"]:
         rng = random.Random(f"{SEED}-{label}")
-        train_pool = images[("train", label)]
-        train = rng.sample(train_pool, min(TRAIN_PER_CLASS, len(train_pool)))
-        pool = list(images[("test", label)])
-        rng.shuffle(pool)
-        if len(pool) < TEST_PER_CLASS + HOLDOUT_PER_CLASS:
-            sys.exit(f"Only {len(pool)} test images for '{label}'; need {TEST_PER_CLASS + HOLDOUT_PER_CLASS}.")
-        test = pool[:TEST_PER_CLASS]
-        holdout = pool[TEST_PER_CLASS:TEST_PER_CLASS + HOLDOUT_PER_CLASS]
+        if ds["split"] == "given":
+            train_pool = images.get(("train", label), [])
+            train = rng.sample(train_pool, min(ds["train_per_class"], len(train_pool)))
+            pool = _unique(images.get(("test", label), []), exclude=every_train_image)
+            rng.shuffle(pool)
+            need = ds["test_per_class"] + ds["holdout_per_class"]
+            if len(pool) < need:
+                sys.exit(f"Only {len(pool)} test images for '{label}'; need {need}.")
+            test = pool[:ds["test_per_class"]]
+            holdout = pool[ds["test_per_class"]:need]
+        else:
+            by_name = {}
+            for split in ("train", "valid", "test"):
+                for p in images.get((split, label), []):
+                    by_name.setdefault(p.name, p)
+            pool = _unique(by_name[n] for n in sorted(by_name))
+            rng.shuffle(pool)
+            n_train = round(len(pool) * ds["fractions"]["train"])
+            n_test = round(len(pool) * ds["fractions"]["test"])
+            train, test, holdout = pool[:n_train], pool[n_train:n_train + n_test], pool[n_train + n_test:]
         out["train"] += [(p, label) for p in train]
         out["test"] += [(p, label) for p in test]
         out["holdout"] += [(p, label) for p in holdout]
-        out["baseline"] += [(p, label) for p in holdout[:BASELINE_PER_CLASS]]
+        out["baseline"] += [(p, label) for p in holdout[:ds["baseline_per_class"]]]
     return out
 
 

@@ -1,7 +1,7 @@
 {
+  "dataset": "casting",
   "bucket": "custom-labels-casting-YOURNAME",
   "region": "us-east-2",
   "profile": "vision-inspection",
-  "project": "casting-inspection",
   "version": "v1"
 }

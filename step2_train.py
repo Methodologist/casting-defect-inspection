@@ -1,4 +1,4 @@
-"""Step 2: upload images, build the Custom Labels datasets and train a defective/ok model.
+"""Step 2: upload images, build the Custom Labels datasets and train a pass/fail model for the chosen dataset.
 
 Safe to re-run: it skips images already uploaded and picks up a training run already in progress.
 Training is billed at about $1 an hour of training time; 1,000 images usually takes about an hour.
@@ -9,25 +9,25 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from common import (EXTENSIONS, LABELS, RESULTS, ROOT, TRAINING_PER_HOUR, client, find_project, find_version,
-                    minutes, run, settings, splits, utc_now)
+from common import (EXTENSIONS, ROOT, TRAINING_PER_HOUR, client, dataset, find_project, find_version, minutes,
+                    results_dir, run, settings, splits, utc_now)
 
 ATTR = "quality"  # the label attribute name inside the manifest; any name works
 
 
-def manifest_line(bucket, key, label, stamp):
+def manifest_line(ds, bucket, key, label, stamp):
     return json.dumps({
         "source-ref": f"s3://{bucket}/{key}",
-        ATTR: LABELS.index(label),
-        f"{ATTR}-metadata": {"confidence": 1, "job-name": "labeling-job/casting-quality", "class-name": label,
+        ATTR: ds["labels"].index(label),
+        f"{ATTR}-metadata": {"confidence": 1, "job-name": f"labeling-job/{ds['name']}-quality", "class-name": label,
                              "human-annotated": "yes", "creation-date": stamp,
                              "type": "groundtruth/image-classification"},
     })
 
 
-def upload_images(s3, bucket, items):
+def upload_images(s3, bucket, prefix, items):
     existing = set()
-    for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix="images/"):
+    for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix):
         existing.update(o["Key"] for o in page.get("Contents", []))
     todo = [(path, key) for path, _, key in items if key not in existing]
     print(f"Uploading {len(todo)} images ({len(items) - len(todo)} already in S3)...")
@@ -64,7 +64,7 @@ def ensure_datasets(rek, s, project):
             have[kind] = rek.create_dataset(
                 ProjectArn=project["ProjectArn"], DatasetType=kind,
                 DatasetSource={"GroundTruthManifest": {"S3Object": {
-                    "Bucket": s["bucket"], "Name": f"manifests/{kind.lower()}.manifest"}}})["DatasetArn"]
+                    "Bucket": s["bucket"], "Name": f"manifests/{s['dataset']}/{kind.lower()}.manifest"}}})["DatasetArn"]
     for kind, arn in have.items():
         while True:
             d = rek.describe_dataset(DatasetArn=arn)["DatasetDescription"]
@@ -89,7 +89,7 @@ def report(s3, v):
         print(f"Overall F1 score: {ev.get('F1Score')}")
         return
     summary = json.loads(s3.get_object(Bucket=loc["Bucket"], Key=loc["Name"])["Body"].read())
-    out = RESULTS / "step2_evaluation.json"
+    out = results_dir() / "step2_evaluation.json"
     out.write_text(json.dumps(summary, indent=2))
     print(f"Saved {out.relative_to(ROOT)}")
 
@@ -102,7 +102,7 @@ def report(s3, v):
         m = r.get("Metrics", {})
         print(f"{r.get('Label', '?'):<12}{r.get('NumberOfTestingImages', '?'):>8}{m.get('Precision', 0):>11.3f}"
               f"{m.get('Recall', 0):>8.3f}{m.get('F1Score', 0):>7.3f}{m.get('Threshold', 0):>11.3f}")
-    print("\nScreenshot the model's Evaluation page in the Rekognition console for the interview. "
+    print("\nScreenshot the model's Evaluation page in the Rekognition console for the presentation. "
           "Next: python step3_test.py")
 
 
@@ -111,26 +111,29 @@ def main():
     ap.add_argument("--no-wait", action="store_true", help="start training and exit; re-run later to see results")
     args = ap.parse_args()
     s = settings()
+    ds = dataset()
     rek, s3 = client("rekognition"), client("s3")
+    print(f"Dataset {ds['name']} ({ds['title']}), project {s['project']}, model {s['version']}")
 
     project = find_project(rek, s["project"])
     v = find_version(rek, project["ProjectArn"], s["version"]) if project else None
     if v is None:
         sp = splits()
         stamp = utc_now()
-        items = {split: [(p, label, f"images/{split}/{label}/{p.name}") for p, label in sp[split]]
+        prefix = f"images/{ds['name']}/"
+        items = {split: [(p, label, f"{prefix}{split}/{label}/{p.name}") for p, label in sp[split]]
                  for split in ("train", "test")}
-        upload_images(s3, s["bucket"], items["train"] + items["test"])
+        upload_images(s3, s["bucket"], prefix, items["train"] + items["test"])
         for split, rows in items.items():
-            body = "\n".join(manifest_line(s["bucket"], key, label, stamp) for _, label, key in rows) + "\n"
-            (RESULTS / f"{split}.manifest").write_text(body)
-            s3.put_object(Bucket=s["bucket"], Key=f"manifests/{split}.manifest", Body=body.encode())
+            body = "\n".join(manifest_line(ds, s["bucket"], key, label, stamp) for _, label, key in rows) + "\n"
+            (results_dir() / f"{split}.manifest").write_text(body)
+            s3.put_object(Bucket=s["bucket"], Key=f"manifests/{ds['name']}/{split}.manifest", Body=body.encode())
         print("Uploaded train and test manifests.")
         project = ensure_project(rek, s["project"])
         ensure_datasets(rek, s, project)
         rek.create_project_version(
             ProjectArn=project["ProjectArn"], VersionName=s["version"],
-            OutputConfig={"S3Bucket": s["bucket"], "S3KeyPrefix": f"output/{s['version']}/"})
+            OutputConfig={"S3Bucket": s["bucket"], "S3KeyPrefix": f"output/{ds['name']}/{s['version']}/"})
         print(f"Training started for model {s['version']}.")
         v = find_version(rek, project["ProjectArn"], s["version"])
 

@@ -1,4 +1,4 @@
-"""Step 3: start the trained model, test it on 100 held-out images it never saw, then stop it.
+"""Step 3: start the trained model, test it on held-out images it never saw, then stop it.
 
 A running model bills about $4 an hour, from start until stopped. This script always stops it at the end,
 including after an error or Ctrl+C. If the window or PC dies mid-run, run stop_model.py.
@@ -8,8 +8,8 @@ import json
 import sys
 import time
 
-from common import (INFERENCE_PER_HOUR, LABELS, POSITIVE, RESULTS, ROOT, client, find_project, find_version,
-                    minutes, pct, run, settings, splits, stop_model, write_csv)
+from common import (INFERENCE_PER_HOUR, ROOT, client, dataset, find_project, find_version, minutes, pct,
+                    results_dir, run, settings, splits, stop_model, write_csv)
 
 
 def main():
@@ -17,6 +17,8 @@ def main():
     ap.add_argument("--yes", action="store_true", help="skip the cost confirmation")
     args = ap.parse_args()
     s = settings()
+    ds = dataset()
+    pos, neg = ds["positive"], ds["negative"]
     rek = client("rekognition")
     project = find_project(rek, s["project"])
     v = find_version(rek, project["ProjectArn"], s["version"]) if project else None
@@ -65,29 +67,31 @@ def main():
         ran = time.time() - began
         print(f"The model ran about {minutes(ran)}, roughly ${ran / 3600 * INFERENCE_PER_HOUR:.2f}.")
 
-    write_csv(RESULTS / "step3_holdout.csv", rows)
-    tp = sum(r["true_label"] == POSITIVE and r["predicted"] == POSITIVE for r in rows)
-    fn = sum(r["true_label"] == POSITIVE and r["predicted"] != POSITIVE for r in rows)
-    fp = sum(r["true_label"] != POSITIVE and r["predicted"] == POSITIVE for r in rows)
+    out = results_dir()
+    write_csv(out / "step3_holdout.csv", rows)
+    tp = sum(r["true_label"] == pos and r["predicted"] == pos for r in rows)
+    fn = sum(r["true_label"] == pos and r["predicted"] != pos for r in rows)
+    fp = sum(r["true_label"] != pos and r["predicted"] == pos for r in rows)
     tn = len(rows) - tp - fn - fp
     precision = tp / (tp + fp) if tp + fp else 0
     recall = tp / (tp + fn) if tp + fn else 0
     accuracy = (tp + tn) / len(rows)
-    summary = {"images": len(rows), "true_positive": tp, "false_negative": fn, "false_positive": fp,
-               "true_negative": tn, "precision": round(precision, 3), "recall": round(recall, 3),
-               "accuracy": round(accuracy, 3)}
-    (RESULTS / "step3_summary.json").write_text(json.dumps(summary, indent=2))
+    summary = {"dataset": ds["name"], "positive_class": pos, "images": len(rows), "true_positive": tp,
+               "false_negative": fn, "false_positive": fp, "true_negative": tn, "precision": round(precision, 3),
+               "recall": round(recall, 3), "accuracy": round(accuracy, 3)}
+    (out / "step3_summary.json").write_text(json.dumps(summary, indent=2))
 
-    print(f"\nHeld-out results ({len(rows)} images the model never saw), 'defective' as the positive class:")
-    print(f"{'':>22}{'predicted defective':>21}{'predicted ok':>14}")
-    print(f"{'actually defective':>22}{tp:>21}{fn:>14}")
-    print(f"{'actually ok':>22}{fp:>21}{tn:>14}")
+    print(f"\nHeld-out results ({len(rows)} {ds['title']} the model never saw), '{pos}' as the positive class:")
+    print(f"{'':>20}{'predicted ' + pos:>20}{'predicted ' + neg:>20}")
+    print(f"{'actually ' + pos:>20}{tp:>20}{fn:>20}")
+    print(f"{'actually ' + neg:>20}{fp:>20}{tn:>20}")
     print(f"\nAccuracy {pct(tp + tn, len(rows))}   precision {precision:.3f}   recall {recall:.3f}")
-    print(f"Missed defects (the costly mistake on a line): {fn}. False rejects of good parts: {fp}.")
+    print(f"Missed {ds['positive_plural']} (the costly mistake on a line): {fn}. "
+          f"False rejects of {ds['negative_plural']}: {fp}.")
     misses = [r["file"] for r in rows if r["correct"] == "no"]
     if misses:
         print("Wrong calls, worth opening to see why: " + ", ".join(misses))
-    print(f"Saved {(RESULTS / 'step3_summary.json').relative_to(ROOT)}")
+    print(f"Saved {(out / 'step3_summary.json').relative_to(ROOT)}")
 
 
 if __name__ == "__main__":

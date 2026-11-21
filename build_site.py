@@ -98,6 +98,21 @@ def load(name):
             images.append({"src": rel, "file": src, "truth": r["true_label"], "pred": r["predicted"],
                            "conf": r["confidence"], "ok": r["correct"] == "yes"})
         d["holdout"] = {"summary": summary, "images": images}
+
+    # SageMaker Grad-CAM run (optional): only shown once real results exist.
+    sm_dir = out_dir / "sagemaker"
+    preds, metrics = read_json(sm_dir / "predictions.json"), read_json(sm_dir / "metrics.json")
+    d["sm"] = None
+    if preds and metrics and d["holdout"]:
+        srcs = {im["file"].name: im["src"] for im in d["holdout"]["images"]}
+        rows = []
+        for r in preds:
+            heat_file = sm_dir / r["heatmap"]
+            if r["file"] in srcs and heat_file.exists():
+                rows.append({"src": srcs[r["file"]], "heat_file": heat_file,
+                             "heat": f"heat/{name}/{heat_file.name}", "truth": r["true_label"],
+                             "pred": r["predicted"], "conf": r["confidence"], "ok": r["correct"]})
+        d["sm"] = {"metrics": metrics, "rows": rows}
     return d
 
 
@@ -170,6 +185,52 @@ def eval_table(d):
             f'<p class="caption">AWS\'s own evaluation after training, on the {esc(e["images"])}-image test set '
             f'(overall F1 {pct(e["f1"], 1)}). The held-out numbers above come from separate images the model never '
             f'saw during training or evaluation.</p>')
+
+
+def heat_data(data):
+    """Heatmap library items, classes interleaved like the verdict gallery."""
+    items = []
+    for d in data:
+        if not d["sm"]:
+            continue
+        by_class = [[r for r in d["sm"]["rows"] if r["truth"] == label] for label in d["ds"]["labels"]]
+        for n in range(max((len(c) for c in by_class), default=0)):
+            for c in by_class:
+                if n < len(c):
+                    r = c[n]
+                    items.append({"d": d["name"], "src": r["src"], "h": r["heat"], "t": r["truth"], "p": r["pred"],
+                                  "c": r["conf"], "ok": r["ok"], "pos": r["truth"] == d["ds"]["positive"]})
+    return items
+
+
+def heat_section(data):
+    runs = [d for d in data if d["sm"]]
+    if not runs:
+        return ""
+    rows = ""
+    for d in runs:
+        m, s = d["sm"]["metrics"], (d["holdout"] or {}).get("summary", {})
+        rows += (f'<tr><td>{esc(d["ds"]["title"].capitalize())}</td>'
+                 f'<td>{pct(s.get("accuracy"), 1)}</td><td>{pct(m["heldout_accuracy"], 1)}</td>'
+                 f'<td>{s.get("false_negative", "–")} / {m["fn"]}</td><td>{s.get("false_positive", "–")} / {m["fp"]}</td></tr>')
+    return f'''<section><div class="wrap">
+<h2>Where the model looks</h2>
+<p class="sub">A second model, a ResNet-18 fine-tuned in an Amazon SageMaker AI training job on the same training
+images, with Grad-CAM heatmaps showing which parts of each held-out image pushed it toward
+"{esc(runs[0]["ds"]["positive"])}". Heat is drawn as a separate layer over the unmodified photo; switch it off to
+compare.</p>
+<div class="tablewrap"><table class="eval"><thead><tr><th>Dataset</th><th>Rekognition held-out accuracy</th>
+<th>SageMaker ResNet-18 held-out accuracy</th><th>Missed (Rekognition / SageMaker)</th>
+<th>False rejects (Rekognition / SageMaker)</th></tr></thead><tbody>{rows}</tbody></table></div>
+<p class="caption">Same held-out images for both models. The heatmaps show where this model found evidence; they
+explain its decision, not a guaranteed defect outline.</p>
+<p class="legend"><span>Less evidence</span><span class="ramp"></span><span>More evidence for a defect</span></p>
+<div class="tabs" id="htabs" role="group" aria-label="Dataset"></div>
+<div class="tabs" id="hfilters" role="group" aria-label="Show"></div>
+<p class="count" id="hcount"></p>
+<div class="gallery" id="hgallery"></div>
+</div></section>
+'''
 
 
 def gallery_data(data):
@@ -257,6 +318,12 @@ tr.lean td{background:var(--lean)}
 .card.miss{border:2px solid var(--bad);border-top-width:4px}.card.miss .verdict{color:var(--bad)}
 .card .truth{color:var(--muted)}
 .card .open{display:block;width:100%;padding:0;border:0;background:none;cursor:zoom-in}
+.card .frame{position:relative;display:block}
+.card .frame .heat{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;pointer-events:none;background:transparent}
+.vframe{position:relative;line-height:0}
+.viewer .vheat{position:absolute;inset:0;background:transparent;pointer-events:none}
+.legend{display:flex;align-items:center;gap:10px;font-size:13px;color:var(--muted);margin:0 0 12px}
+.legend .ramp{width:140px;height:12px;border-radius:3px;border:1px solid var(--line);background:linear-gradient(90deg,rgba(255,230,0,.25),rgba(255,115,0,.6),rgba(255,0,0,.85))}
 .card .open:focus-visible{outline:3px solid var(--pos);outline-offset:-3px}
 dialog.viewer{position:fixed;inset:0;margin:0;border:0;padding:0;background:transparent;max-width:none;max-height:none;
 width:100%;height:100%;color:#fff;overflow:hidden}
@@ -285,7 +352,7 @@ footer{padding:28px 0 48px;font-size:13px;color:var(--muted)}
 </head>
 <body>
 <header><div class="wrap">
-<h1>Automated visual inspection with Amazon Rekognition</h1>
+<h1>__TITLE__</h1>
 <p class="lede">A pass/fail camera check of the kind a robot cell runs: train a custom vision model on labeled
 photos, then measure it on images it has never seen, counting missed defects and false rejects separately.</p>
 <p class="meta">Two datasets: cast pump impellers (main run) and damaged vs intact shipping cases ·
@@ -317,11 +384,12 @@ __MODEL__
 <h2>Every held-out image</h2>
 <p class="sub">The model's verdict and confidence for each image it was tested on. Images are shown unmodified;
 the verdict sits beside them.</p>
-<div class="tabs" id="gtabs" role="group" aria-label="Filter images"></div>
+<div class="tabs" id="gtabs" role="group" aria-label="Dataset"></div>
+<div class="tabs" id="gfilters" role="group" aria-label="Show"></div>
 <p class="count" id="gcount"></p>
 <div class="gallery" id="gallery"></div>
 </div></section>
-
+__HEAT_SECTION__
 <section><div class="wrap">
 <h2>From demo to robot cell</h2>
 <p class="sub">How the same approach would fit a production inspection station.</p>
@@ -358,12 +426,12 @@ __CREDITS__
 </ul>
 </div></section>
 
-<footer><div class="wrap">Built with Amazon Rekognition Custom Labels and Amazon S3, hosted on Amazon CloudFront.
+<footer><div class="wrap">__BUILT_WITH__
 Images remain the property of their creators and are used under the licenses listed above.</div></footer>
 
 <dialog class="viewer" id="viewer" aria-label="Enlarged image">
 <div class="stage" id="vstage">
-<img id="vimg" alt="">
+<div class="vframe"><img id="vimg" alt=""><img id="vheat" class="vheat" alt="" hidden></div>
 <div class="vcap" id="vcap"></div>
 </div>
 <button class="vclose" id="vclose" aria-label="Close">✕</button>
@@ -372,66 +440,82 @@ Images remain the property of their creators and are used under the licenses lis
 </dialog>
 
 <script>
-const ITEMS = __ITEMS__;
-const NAMES = __NAMES__;
-const tabs = document.getElementById("gtabs"), grid = document.getElementById("gallery"),
-      count = document.getElementById("gcount");
-let state = {d: NAMES.length ? NAMES[0][0] : null, show: "all"};
-const filters = document.createElement("div"); filters.className = "tabs"; filters.setAttribute("role", "group");
-filters.setAttribute("aria-label", "Show"); tabs.after(filters);
+const ITEMS = __ITEMS__, NAMES = __NAMES__, HEAT = __HEAT_ITEMS__;
+const cap = s => s ? s[0].toUpperCase() + s.slice(1) : s;
 function button(label, pressed, onClick) {
-  const b = document.createElement("button"); b.textContent = label;
+  const b = document.createElement("button"); b.type = "button"; b.textContent = label;
   b.setAttribute("aria-pressed", pressed); b.onclick = onClick; return b;
 }
-function render() {
-  tabs.replaceChildren();
-  NAMES.forEach(([key, title]) => tabs.append(button(title, state.d === key, () => { state.d = key; render(); })));
-  const [, , posLabel, negLabel] = NAMES.find(n => n[0] === state.d) || [];
-  const cap = s => s ? s[0].toUpperCase() + s.slice(1) : s;
-  filters.replaceChildren(...[["all", "All"], ["pos", `Actually ${posLabel}`], ["neg", `Actually ${negLabel}`],
-                              ["wrong", "Mistakes only"]].map(([k, label]) =>
-    button(label, state.show === k, () => { state.show = k; render(); })));
-  const all = ITEMS.filter(i => i.d === state.d);
-  const shown = all.filter(i => state.show === "all" || (state.show === "pos" && i.pos) ||
-                                (state.show === "neg" && !i.pos) || (state.show === "wrong" && !i.ok));
-  const nPos = all.filter(i => i.pos).length;
-  count.textContent = all.length
-    ? `Showing ${shown.length} of ${all.length} · ${cap(posLabel)}: ${nPos}, ${negLabel}: ${all.length - nPos} · ` +
-      `${all.filter(i => !i.ok).length} wrong calls`
-    : "Held-out test not run yet.";
-  current = shown;
-  grid.replaceChildren(...shown.map((i, n) => {
-    const c = document.createElement("figure"); c.className = "card " + (i.ok ? "ok" : "miss"); c.style.margin = 0;
-    const img = document.createElement("img"); img.src = i.src; img.loading = "lazy";
-    img.alt = `Held-out image, actually ${i.t}`;
-    const open = document.createElement("button"); open.className = "open"; open.type = "button";
-    open.setAttribute("aria-label", `Enlarge image ${n + 1}: actually ${i.t}, predicted ${i.p}`);
-    open.onclick = () => show(n, open); open.append(img);
-    const info = document.createElement("figcaption"); info.className = "info";
-    const v = document.createElement("div"); v.className = "verdict";
-    v.textContent = (i.ok ? "✓ " : "✗ ") + `Predicted ${i.p}` + (i.c ? ` · ${Math.round(+i.c)}%` : "");
-    const t = document.createElement("div"); t.className = "truth"; t.textContent = `Actually ${i.t}`;
-    info.append(v, t); c.append(open, info); return c;
-  }));
+
+// One gallery = dataset tabs + filters + grid. Used for the verdict gallery and the heatmap library.
+function makeGallery(items, ids, withHeat) {
+  const tabs = document.getElementById(ids.tabs), filters = document.getElementById(ids.filters),
+        grid = document.getElementById(ids.grid), count = document.getElementById(ids.count);
+  if (!grid) return null;
+  const names = NAMES.filter(n => items.some(i => i.d === n[0]));
+  const st = {d: names.length ? names[0][0] : null, show: "all", heat: true};
+  let shown = [];
+  function render() {
+    tabs.replaceChildren(...names.map(([key, title]) =>
+      button(title, st.d === key, () => { st.d = key; render(); })));
+    const [, , posLabel, negLabel] = names.find(n => n[0] === st.d) || [];
+    const opts = [["all", "All"], ["pos", `Actually ${posLabel}`], ["neg", `Actually ${negLabel}`],
+                  ["wrong", "Mistakes only"]];
+    filters.replaceChildren(...opts.map(([k, label]) => button(label, st.show === k, () => { st.show = k; render(); })));
+    if (withHeat) filters.append(button(st.heat ? "Heatmap: on" : "Heatmap: off", st.heat,
+                                        () => { st.heat = !st.heat; render(); }));
+    const all = items.filter(i => i.d === st.d);
+    shown = all.filter(i => st.show === "all" || (st.show === "pos" && i.pos) ||
+                            (st.show === "neg" && !i.pos) || (st.show === "wrong" && !i.ok));
+    const nPos = all.filter(i => i.pos).length;
+    count.textContent = all.length
+      ? `Showing ${shown.length} of ${all.length} · ${cap(posLabel)}: ${nPos}, ${negLabel}: ${all.length - nPos} · ` +
+        `${all.filter(i => !i.ok).length} wrong calls`
+      : "Not run yet.";
+    grid.replaceChildren(...shown.map((i, n) => {
+      const c = document.createElement("figure"); c.className = "card " + (i.ok ? "ok" : "miss"); c.style.margin = 0;
+      const open = document.createElement("button"); open.className = "open"; open.type = "button";
+      open.setAttribute("aria-label", `Enlarge image ${n + 1}: actually ${i.t}, predicted ${i.p}`);
+      const frame = document.createElement("span"); frame.className = "frame";
+      const img = document.createElement("img"); img.src = i.src; img.loading = "lazy";
+      img.alt = `Held-out image, actually ${i.t}`; frame.append(img);
+      if (withHeat && st.heat && i.h) {
+        const h = document.createElement("img"); h.src = i.h; h.loading = "lazy"; h.alt = ""; h.className = "heat";
+        frame.append(h);
+      }
+      open.append(frame);
+      open.onclick = () => show(shown, n, open, withHeat && st.heat);
+      const info = document.createElement("figcaption"); info.className = "info";
+      const v = document.createElement("div"); v.className = "verdict";
+      v.textContent = (i.ok ? "✓ " : "✗ ") + `Predicted ${i.p}` + (i.c ? ` · ${Math.round(+i.c)}%` : "");
+      const t = document.createElement("div"); t.className = "truth"; t.textContent = `Actually ${i.t}`;
+      info.append(v, t); c.append(open, info); return c;
+    }));
+  }
+  render();
+  return () => shown;
 }
 
 // Enlarged view: click an image; arrows or ←/→ to move, Esc / ✕ / click outside to close.
 const viewer = document.getElementById("viewer"), vimg = document.getElementById("vimg"),
-      vcap = document.getElementById("vcap");
-let current = [], at = 0, opener = null;
+      vheat = document.getElementById("vheat"), vcap = document.getElementById("vcap");
+let current = [], at = 0, opener = null, heatOn = false;
 function paint() {
   const i = current[at];
   vimg.src = i.src; vimg.alt = `Held-out image ${at + 1} of ${current.length}, actually ${i.t}`;
+  vheat.hidden = !(heatOn && i.h);
+  if (heatOn && i.h) vheat.src = i.h;
   vcap.replaceChildren();
   const b = document.createElement("b"); b.className = i.ok ? "vok" : "vmiss";
   b.textContent = (i.ok ? "✓ Correct: " : "✗ Wrong: ") + `predicted ${i.p}` + (i.c ? ` · ${Math.round(+i.c)}% confident` : "");
   const t = document.createElement("div"); t.textContent = `Actually ${i.t}`;
   const m = document.createElement("div"); m.className = "vmeta";
-  m.textContent = `Image ${at + 1} of ${current.length} · original resolution, shown enlarged`;
+  m.textContent = `Image ${at + 1} of ${current.length} · original resolution, shown enlarged` +
+                  (heatOn && i.h ? " · heatmap drawn as a separate layer" : "");
   vcap.append(b, t, m);
 }
-function show(n, from) {
-  at = n; opener = from || null; paint();
+function show(list, n, from, withHeat) {
+  current = list; at = n; opener = from || null; heatOn = !!withHeat; paint();
   if (!viewer.open) viewer.showModal();
 }
 function step(d) { if (current.length) { at = (at + d + current.length) % current.length; paint(); } }
@@ -444,8 +528,11 @@ viewer.addEventListener("keydown", e => {
   if (e.key === "ArrowRight") { step(1); e.preventDefault(); }
 });
 viewer.addEventListener("close", () => { if (opener) opener.focus(); });
-render();
-if (location.hash === "#preview-viewer" && current.length) show(0);
+
+const verdictShown = makeGallery(ITEMS, {tabs: "gtabs", filters: "gfilters", grid: "gallery", count: "gcount"}, false);
+const heatShown = makeGallery(HEAT, {tabs: "htabs", filters: "hfilters", grid: "hgallery", count: "hcount"}, true);
+if (location.hash === "#preview-viewer" && verdictShown) show(verdictShown(), 0);
+if (location.hash === "#preview-heat" && heatShown && heatShown().length) show(heatShown(), 0, null, true);
 </script>
 </body>
 </html>
@@ -487,10 +574,20 @@ def main():
     names = [[d["name"], d["ds"]["title"].capitalize(), d["ds"]["positive"], d["ds"]["negative"]]
              for d in data if d["holdout"]]
 
+    used_sagemaker = any(d["sm"] for d in data)
+    title = ("Automated visual inspection with Amazon Rekognition and Amazon SageMaker AI" if used_sagemaker
+             else "Automated visual inspection with Amazon Rekognition")
+    built_with = ("Built with Amazon Rekognition Custom Labels, Amazon SageMaker AI and Amazon S3, hosted on AWS "
+                  "Amplify Hosting." if used_sagemaker else
+                  "Built with Amazon Rekognition Custom Labels and Amazon S3, hosted on AWS Amplify Hosting.")
+
     page = (PAGE.replace("__REPO__", REPO_URL).replace("__DATE__", date.today().strftime("%B %Y"))
+            .replace("__TITLE__", title).replace("__BUILT_WITH__", built_with)
             .replace("__KPIS__", kpi_html).replace("__BASELINE__", base_html).replace("__MODEL__", model_html)
+            .replace("__HEAT_SECTION__", heat_section(data))
             .replace("__CREDITS__", credits_html)
             .replace("__ITEMS__", json.dumps(items).replace("</", "<\\/"))
+            .replace("__HEAT_ITEMS__", json.dumps(heat_data(data)).replace("</", "<\\/"))
             .replace("__NAMES__", json.dumps(names).replace("</", "<\\/")))
     privacy_check(page, bucket)
 
@@ -501,6 +598,10 @@ def main():
             dest = SITE / im["src"]
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(im["file"], dest)  # byte-for-byte: no resizing, cropping or re-encoding
+        for r in (d["sm"] or {}).get("rows", []):
+            dest = SITE / r["heat"]
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(r["heat_file"], dest)  # separate overlay layer; the photo itself is never altered
     SITE.mkdir(exist_ok=True)
     (SITE / "index.html").write_text(page, encoding="utf-8")
     n_img = sum(1 for p in SITE.rglob("*") if p.is_file()) - 1
@@ -508,6 +609,7 @@ def main():
     for d in data:
         state = ("held-out test done" if d["holdout"] else "training done" if d["eval"]
                  else "baseline only" if d["baseline"] else "nothing yet")
+        state += f", SageMaker heatmaps: {len(d['sm']['rows'])}" if d["sm"] else ", SageMaker heatmaps: not yet"
         print(f"  {d['name']}: {state}")
 
 

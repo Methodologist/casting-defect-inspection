@@ -173,12 +173,18 @@ def eval_table(d):
 
 
 def gallery_data(data):
+    """Gallery items with the classes interleaved (good, bad, good, bad...) so no screen shows only one class."""
     items = []
     for d in data:
-        if d["holdout"]:
-            for im in d["holdout"]["images"]:
-                items.append({"d": d["name"], "src": im["src"], "t": im["truth"], "p": im["pred"],
-                              "c": im["conf"], "ok": im["ok"]})
+        if not d["holdout"]:
+            continue
+        by_class = [[im for im in d["holdout"]["images"] if im["truth"] == label] for label in d["ds"]["labels"]]
+        for n in range(max(len(c) for c in by_class)):
+            for c in by_class:
+                if n < len(c):
+                    im = c[n]
+                    items.append({"d": d["name"], "src": im["src"], "t": im["truth"], "p": im["pred"],
+                                  "c": im["conf"], "ok": im["ok"], "pos": im["truth"] == d["ds"]["positive"]})
     return items
 
 
@@ -370,7 +376,9 @@ const ITEMS = __ITEMS__;
 const NAMES = __NAMES__;
 const tabs = document.getElementById("gtabs"), grid = document.getElementById("gallery"),
       count = document.getElementById("gcount");
-let state = {d: NAMES.length ? NAMES[0][0] : null, wrong: false};
+let state = {d: NAMES.length ? NAMES[0][0] : null, show: "all"};
+const filters = document.createElement("div"); filters.className = "tabs"; filters.setAttribute("role", "group");
+filters.setAttribute("aria-label", "Show"); tabs.after(filters);
 function button(label, pressed, onClick) {
   const b = document.createElement("button"); b.textContent = label;
   b.setAttribute("aria-pressed", pressed); b.onclick = onClick; return b;
@@ -378,11 +386,19 @@ function button(label, pressed, onClick) {
 function render() {
   tabs.replaceChildren();
   NAMES.forEach(([key, title]) => tabs.append(button(title, state.d === key, () => { state.d = key; render(); })));
-  tabs.append(button("Mistakes only", state.wrong, () => { state.wrong = !state.wrong; render(); }));
-  const shown = ITEMS.filter(i => i.d === state.d && (!state.wrong || !i.ok));
+  const [, , posLabel, negLabel] = NAMES.find(n => n[0] === state.d) || [];
+  const cap = s => s ? s[0].toUpperCase() + s.slice(1) : s;
+  filters.replaceChildren(...[["all", "All"], ["pos", `Actually ${posLabel}`], ["neg", `Actually ${negLabel}`],
+                              ["wrong", "Mistakes only"]].map(([k, label]) =>
+    button(label, state.show === k, () => { state.show = k; render(); })));
   const all = ITEMS.filter(i => i.d === state.d);
-  count.textContent = all.length ? `${shown.length} of ${all.length} images · ${all.filter(i => !i.ok).length} wrong calls`
-                                 : "Held-out test not run yet.";
+  const shown = all.filter(i => state.show === "all" || (state.show === "pos" && i.pos) ||
+                                (state.show === "neg" && !i.pos) || (state.show === "wrong" && !i.ok));
+  const nPos = all.filter(i => i.pos).length;
+  count.textContent = all.length
+    ? `Showing ${shown.length} of ${all.length} · ${cap(posLabel)}: ${nPos}, ${negLabel}: ${all.length - nPos} · ` +
+      `${all.filter(i => !i.ok).length} wrong calls`
+    : "Held-out test not run yet.";
   current = shown;
   grid.replaceChildren(...shown.map((i, n) => {
     const c = document.createElement("figure"); c.className = "card " + (i.ok ? "ok" : "miss"); c.style.margin = 0;
@@ -468,7 +484,8 @@ def main():
                            f'{esc(CREDITS[d["name"]][0])}</a>, licensed <a href="{esc(CREDITS[d["name"]][3])}">'
                            f'{esc(CREDITS[d["name"]][2])}</a>.</li>' for d in data)
     items = gallery_data(data)
-    names = [[d["name"], d["ds"]["title"].capitalize()] for d in data if d["holdout"]]
+    names = [[d["name"], d["ds"]["title"].capitalize(), d["ds"]["positive"], d["ds"]["negative"]]
+             for d in data if d["holdout"]]
 
     page = (PAGE.replace("__REPO__", REPO_URL).replace("__DATE__", date.today().strftime("%B %Y"))
             .replace("__KPIS__", kpi_html).replace("__BASELINE__", base_html).replace("__MODEL__", model_html)

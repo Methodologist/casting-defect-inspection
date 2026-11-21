@@ -9,6 +9,8 @@
 >   every held-out image with its verdict and our CNN's heatmap, and click any image to inspect it.
 > - **[Project overview (PDF)](docs/project-overview.pdf)**: a two-page summary of what was built, the
 >   results and the lessons.
+> - **[From demo to factory](docs/factory-guide.md)**: the simplest way to set this up on a real production
+>   line, from camera station to labeling to PLC.
 
 ## Results at a glance
 

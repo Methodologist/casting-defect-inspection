@@ -758,6 +758,8 @@ images. (The casting dataset's license is also non-commercial.)</li>
 <li><b>Tune the threshold to the cost of a miss.</b> Lowering the confidence needed to reject catches more defects
 at the price of more false rejects. Where a missed defect reaches a customer, that trade is usually worth it.</li>
 </ul>
+<p><a href="__REPO__/blob/main/docs/factory-guide.md">From demo to factory: the simplest working setup</a>, a
+step-by-step guide from camera station to labeling to PLC.</p>
 </div></section>
 
 <section><div class="wrap">

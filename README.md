@@ -1,5 +1,31 @@
 # Casting defect inspection with Amazon Rekognition
 
+> **Showcase project.** A portfolio demonstration of camera-based pass/fail inspection on AWS, built on public
+> datasets. It is not a production system and is not maintained as a library. For a two-page summary of what
+> was built, the results and the lessons, see the
+> **[project overview (PDF)](docs/project-overview.pdf)**.
+
+## Results at a glance
+
+Measured on held-out images the model never saw during training or AWS's own evaluation.
+
+| Dataset | Held-out accuracy | Defects missed | Good items rejected | AWS test-set F1 |
+|---|---|---|---|---|
+| Cast pump impellers | **100%** (100 images) | 0 of 50 | 0 of 50 | 100% (200 images) |
+| Shipping cases, damaged vs intact | **88.6%** (88 images) | 6 of 39 | 4 of 49 | 95.7% (116 images) |
+
+- **Off-the-shelf AI isn't an inspector:** general Rekognition labels (coil, rotor, spoke) appear on good and
+  defective castings alike.
+- **Consistent images make the job easy:** the casting photos come from one camera setup, and every held-out part
+  was classified correctly.
+- **Messy data needs skepticism:** the web-collected shipping-case photos also differ in box type, and the model's
+  held-out mistakes cluster where box type and damage disagree. It partly learned the shortcut, which is why a
+  production model is trained on consistent photos from the real station.
+
+The whole project used about $3 to $4 of AWS credits; models are stopped as soon as each test ends.
+
+## About the project
+
 A small computer vision project: tell good parts from bad ones, the kind of pass/fail check a camera does
 in a robot cell. The main run inspects cast pump impellers. The same pipeline then runs unchanged on
 damaged vs intact shipping cases, the check that matters before a robot depalletizes or ships a load.

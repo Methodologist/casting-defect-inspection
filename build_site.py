@@ -374,6 +374,10 @@ FORBIDDEN = [
 
 def privacy_check(text, bucket):
     problems = [why for rx, why in FORBIDDEN if rx.search(text)]
+    # Names that must never appear on the public page, kept in the git-ignored settings.json ("private_terms").
+    terms = json.loads((ROOT / "settings.json").read_text()).get("private_terms", [])
+    if any(t.lower() in text.lower() for t in terms if t):
+        problems.append("a term listed in private_terms")
     if bucket and bucket in text:
         problems.append("the training bucket's name")
     if problems:
